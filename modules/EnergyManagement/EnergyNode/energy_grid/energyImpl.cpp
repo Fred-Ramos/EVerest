@@ -135,6 +135,12 @@ void energyImpl::set_external_limits(types::energy::ExternalLimits& l) {
     }
 
     energy_state_handle->energy_flow_request.schedule_setpoints = l.schedule_setpoints;
+
+    // Hand the new limits to the energy manager now, flagged as a priority request so it re-optimises at once
+    // instead of at its next update_interval tick. A copy, so the cached request does not stay flagged.
+    EnergyState state = *energy_state_handle;
+    state.energy_flow_request.priority_request = true;
+    publish_complete_energy_object(state);
 }
 
 void energyImpl::publish_complete_energy_object(const EnergyState& state) {
