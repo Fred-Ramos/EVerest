@@ -227,6 +227,11 @@ An EVSE pause of an ISO 15118-20 session follows the control mode the EV selecte
 Once notified the EV has ``NotificationMaxDelay``, fixed at 60 s ([V2G20-1850]), to
 pause; ``StoppingCharging`` waits 65 s before the hard stop.
 
+With ``hlc_charge_loop_without_energy_pause``, a charge loop without energy for
+``hlc_charge_loop_without_energy_timeout_s`` is handled as an EVSE pause too, and the
+session resumes once energy is available again. Without it, and for DIN SPEC 70121 and
+ISO 15118-2, the session is terminated.
+
 **Stop Conditions**
 
 The transition ``Charging`` -> ``StoppingCharging`` occurs if:
