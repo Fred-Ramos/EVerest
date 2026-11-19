@@ -27,6 +27,11 @@ struct Conf {
     double DefaultRetryInterval;
     int ResetDelay;
     bool ResetAfterUpdate;
+    std::string DiagnosticsLogDirectory;
+    std::string DiagnosticsLogFileFilter;
+    std::string SecurityLogDirectory;
+    std::string SecurityLogFileFilter;
+    int LogUploadMaxSizeMB;
 };
 
 class System : public Everest::ModuleBase {

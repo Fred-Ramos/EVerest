@@ -8,10 +8,9 @@ This module implements and integrates OCPP within EVerest. It supports three pro
 OCPP 1.6, OCPP 2.0.1 and OCPP 2.1. A connection to a Charging Station Management System (CSMS) can be established by
 loading this module as part of the EVerest configuration. The module leverages libocpp, EVerest's OCPP library.
 
-OCPPmulti is the recommended OCPP module for new EVerest configurations. It deprecates the separate
-:ref:`OCPP <everest_modules_OCPP>` (OCPP 1.6) and :ref:`OCPP201 <everest_modules_OCPP201>` (OCPP 2.0.1 / 2.1)
-modules; see :ref:`Migrate to the Combined OCPP Module <howto-ocpp-storage-migration>` for moving an
-existing deployment.
+OCPPmulti is the OCPP module of EVerest. It replaces the separate ``OCPP`` (OCPP 1.6) and ``OCPP201``
+(OCPP 2.0.1 / 2.1) modules, which were deprecated in 2026.10.0 and are no longer part of EVerest; see
+:ref:`Migrate to the Combined OCPP Module <howto-ocpp-storage-migration>` for moving an existing deployment.
 
 In this document, **OCPP 2.x** refers to OCPP 2.0.1 and OCPP 2.1 collectively.
 
@@ -53,13 +52,13 @@ reference section of this page (taken from the module's ``manifest.yaml``). The 
 Renamed configuration keys
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Compared to the deprecated :ref:`OCPP <everest_modules_OCPP>` (1.6) module, two keys were renamed (the
-:ref:`OCPP201 <everest_modules_OCPP201>` module already uses the new names):
+Compared to the removed ``OCPP`` (1.6) module, two keys were renamed (the removed ``OCPP201`` module already
+used the new names):
 
 * ``PublishChargingScheduleIntervalS`` is now ``CompositeScheduleIntervalS``
 * ``PublishChargingScheduleDurationS`` is now ``RequestCompositeScheduleDurationS``
 
-Compared to the :ref:`OCPP201 <everest_modules_OCPP201>` module, ``CustomMrecErrorMapPath`` is replaced by
+Compared to the removed ``OCPP201`` module, ``CustomMrecErrorMapPath`` is replaced by
 the experimental ``CustomErrorMappingPath``, which takes a file in a different format (see
 :ref:`error reporting <handwritten_ocppmulti_error-reporting>`). An override ``"<error type>": "<techCode>"`` of the
 old file becomes ``"<error type>": {"v2": {"tech_code": "<techCode>"}}``.
@@ -85,8 +84,8 @@ The provider must answer promptly (``NotSupported`` is acceptable). With the :re
 module the external client must reply to ``e2m/configure_network``; a client that stays silent blocks every
 connection attempt until the request times out, so the charge point never reaches the CSMS.
 
-With the default ``false`` no request is sent and the connection is established as with the
-:ref:`OCPP201 <everest_modules_OCPP201>` module (``IFace`` handling included).
+With the default ``false`` no request is sent and the connection is established directly (``IFace`` handling
+included).
 
 Device model configuration via component configs
 =================================================
@@ -99,9 +98,19 @@ component configs are installed). The directory contains two subdirectories:
 * ``standardized``: components and variables standardized by the OCPP specification. Usually untouched by
   integrators.
 * ``custom``: components that are custom for a specific charging station. This is where integrators add or override
-  components and variables, especially the EVSE and Connector components matching the physical setup.
+  components and variables.
 
-The component configs shipped with EVerest are installed from ``lib/everest/ocpp/config/common/component_config/``.
+The EVSE and Connector components come from the connected EVSE managers: the module registers them at runtime (see
+below), so a custom component config does not need to define them. It can add variables that EVerest does not
+register, such as ``DCInputPhaseControl`` for an EVSE. It must leave out the variables the module registers: the
+module's registration of such a variable is rejected, and the conflict is logged as an error at every start (see
+``FailOnDeviceModelConflicts``).
+
+The standardized component configs are installed from
+``lib/everest/ocpp/config/common/component_config/standardized``. The custom component configs in
+``lib/everest/ocpp/config/common/component_config/custom`` are libocpp examples for a standalone use of libocpp and
+are installed only with ``-DLIBOCPP_INSTALL_CUSTOM_COMPONENT_CONFIG=ON``. They define complete EVSE and Connector
+components; installed next to this module, each variable of them that the module registers is a conflict.
 
 Each JSON file describes one component and all of its variables:
 
@@ -128,8 +137,7 @@ applied and reported automatically.
 OCPP 1.6 configuration: two supported paths
 ===========================================
 
-Unlike the deprecated :ref:`OCPP <everest_modules_OCPP>` module, OCPP 1.6 in this module is backed by the device
-model as well. Two configuration paths are supported:
+Unlike the removed ``OCPP`` module, OCPP 1.6 in this module is backed by the device model as well. Two configuration paths are supported:
 
 **(a) Legacy OCPP 1.6 JSON config.** The classic JSON configuration (``ChargePointConfigPath``, overlaid by
 ``UserConfigPath``) can still be used. It enters the device model via a one-time migration that is enabled by setting
@@ -152,10 +160,14 @@ combinations are documented in
 the legacy JSON into the device model and when serving the device-model-backed configuration at runtime. Custom
 mappings must not target the connection configuration (the ``NetworkConfiguration`` slots, the ``OCPPCommCtrlr``
 network profile selectors, or the ``SecurityCtrlr`` connection fallbacks ``Identity`` and ``BasicAuthPassword``):
-those are managed via the standardized OCPP 1.6 keys with their reboot/reconnect semantics, and a mapping file
-containing such a target is rejected at startup. OCPP 1.6
+those are managed via the standardized OCPP 1.6 keys with their reboot/reconnect semantics, and an entry with such
+a target is ignored with an error log. OCPP 1.6
 keys without a standardized device model counterpart are kept in a dedicated ``OCPP16LegacyCtrlr`` component, whose
-``NumberOfConnectors`` value is automatically patched to the actual number of connected EVSEs. This component is
+``NumberOfConnectors`` value is automatically patched to the actual number of connected EVSEs. An entry in the mapping
+file for such a key, for example ``LightIntensity``, replaces its ``OCPP16LegacyCtrlr`` variable with a variable of
+your component configuration, so that OCPP 1.6 and OCPP 2.x share the value; see
+:ref:`Share an OCPP 1.6 key with your own OCPP 2.x variable <howto-ocpp-storage-migration-share-legacy-key>` for
+the rules. This component is
 required for OCPP 2.x operation as well: the device model is shared between all supported OCPP versions so that the
 station can switch between OCPP 1.6 and OCPP 2.x seamlessly, which requires the full set of components for every
 version to be present. If ``standardized/OCPP16LegacyCtrlr.json`` is absent from ``DeviceModelConfigPath``, a
@@ -204,81 +216,25 @@ With ``DelegateNetworkConfigurationToSystem`` set to ``true``, the ``interface_a
 **configure_network** *replaces* the static ``Internal``/``IFace`` configuration key when binding the websocket -
 including clearing it when the provider answers ``Ready`` or ``NotSupported`` without an address, so ``IFace`` is
 effectively not used on successful attempts. With the default ``false`` no configure_network round-trip is performed
-and ``IFace`` is handled as in the OCPP201 module.
+and ``IFace`` binds the websocket as configured.
 
-The legacy JSON configuration backend (OCPP 1.6 without a device model, as used by the ``OCPP`` module) is
-unaffected by this and keeps the previous single-profile behavior.
+Who contributes to the device model
+===================================
 
-OCPP device model vs. EVerest device model
-==========================================
+The component configuration is one of four contributors. libocpp, the EVerest modules this module is connected to
+(``EVSE``, ``Connector``, ``ConnectedEV``, the DER controllers and others) and the configuration service (one
+component per EVerest module whose configuration the OCPP module may read) add to the device model at every start.
+All of it is part of the device model on both protocol paths and reachable through the ``ocpp`` interface; an OCPP
+1.6 CSMS reaches only the keys that have a device model mapping. In OCPP 1.6 mode, ``monitor_variables`` on the
+``ocpp`` interface does not report the values the module reports at runtime, such as ``Power``: the 1.6 path reports
+only writes made through the OCPP stack or the ``ocpp`` interface. In OCPP 2.x mode every change is reported.
 
-The module composes two device model storages behind libocpp's ``DeviceModelStorageInterface``:
+How the pieces are composed, in which order they arrive and what the database keeps:
 
-* The **OCPP device model** (source id ``OCPP``): the integrator-facing configuration described above. It is defined
-  by the component config JSON files and backed by libocpp's SQLite storage (``DeviceModelDatabasePath``). This is
-  the storage integrators configure.
-* The **EVerest device model** (source id ``EVEREST``): runtime telemetry that is closely related to EVerest and
-  therefore not owned and managed by libocpp. Examples: ``Available`` and ``AvailabilityState`` of the EVSE and
-  Connector components, ``Power`` of the EVSE component, and ``Available``, ``VehicleId`` and ``ProtocolAgreed`` of
-  the ``ConnectedEV`` component. It is persisted in ``EverestDeviceModelDatabasePath`` and populated by the module at
-  runtime, e.g. from power meter values and EV information reported by the connected EVSE managers.
+.. toctree::
+   :maxdepth: 1
 
-The ``ComposedDeviceModelStorage`` routes each variable access to its owning storage by the variable's ``source``
-field, which defaults to ``OCPP``.
-
-The composed storage backs **both** protocol paths: in OCPP 2.x it is the device model of the libocpp
-``ChargePoint``, and in OCPP 1.6 it backs the device-model-based charge point configuration. Variables of both
-sources are therefore visible and settable through the EVerest ``ocpp`` interface (``get_variables`` /
-``set_variables``, e.g. via the ``ocpp_consumer_API`` module) regardless of the active protocol version. Note that
-an OCPP 1.6 **CSMS** still cannot address EVerest device model variables directly: ``GetConfiguration`` /
-``ChangeConfiguration`` are key-based, and only keys with a device model mapping (built-in or via
-``Ocpp16KeyMappingsPath``) reach the device model. Also note that variables of source ``EVEREST`` are updated
-by the module at runtime directly in the ``EverestDeviceModelStorage``; such updates do not trigger
-``monitor_variables`` events on the ``ocpp`` interface (in either protocol version) — only writes performed through
-the OCPP stack or the ``ocpp`` interface do. If a component/variable is defined in both storages, the EVerest
-device model takes precedence for that variable and a warning is logged at startup; the integrator is
-responsible for avoiding such overlaps.
-
-.. mermaid::
-
-   classDiagram
-       class DeviceModel
-       class DeviceModelStorageInterface {
-           <<interface>>
-       }
-       class ComposedDeviceModelStorage
-       class DeviceModelStorageSqlite
-       class EverestDeviceModelStorage
-       DeviceModel --> DeviceModelStorageInterface : uses
-       DeviceModelStorageInterface <|.. ComposedDeviceModelStorage
-       DeviceModelStorageInterface <|.. DeviceModelStorageSqlite
-       DeviceModelStorageInterface <|.. EverestDeviceModelStorage
-       ComposedDeviceModelStorage o-- DeviceModelStorageSqlite : source OCPP
-       ComposedDeviceModelStorage o-- EverestDeviceModelStorage : source EVEREST
-
-A ``SetVariables.req`` from the CSMS is routed as follows:
-
-.. mermaid::
-
-   sequenceDiagram
-       participant CSMS
-       participant CP as libocpp ChargePoint
-       participant Composed as ComposedDeviceModelStorage
-       participant Sqlite as DeviceModelStorageSqlite
-       participant Everest as EverestDeviceModelStorage
-
-       CSMS->>CP: SetVariables.req
-       CP->>Composed: set_variable_attribute_value(component, variable, value)
-       Composed->>Composed: get_variable_source(component, variable)
-       alt source is OCPP (default)
-           Composed->>Sqlite: set_variable_attribute_value(...)
-           Sqlite-->>Composed: SetVariableStatus
-       else source is EVEREST
-           Composed->>Everest: set_variable_attribute_value(...)
-           Everest-->>Composed: SetVariableStatus
-       end
-       Composed-->>CP: SetVariableStatus
-       CP-->>CSMS: SetVariables.conf
+   device_model
 
 Integration in EVerest
 ======================
@@ -287,8 +243,8 @@ Libocpp fulfills a large amount of protocol requirements internally, but OCPP af
 areas of a charging station's operation. The integration of libocpp with the other parts of EVerest is done by this
 module via the interfaces it provides and requires.
 
-📌 **Note:** The ``ocpp_1_6_charge_point`` interface (``main`` implementation) of the deprecated
-:ref:`OCPP <everest_modules_OCPP>` module is NOT provided by this module. The ``ocpp_generic`` interface
+📌 **Note:** The ``ocpp_1_6_charge_point`` interface (``main`` implementation) of the removed ``OCPP`` module is
+NOT provided by this module. The ``ocpp_generic`` interface
 covers the same functionality.
 
 .. _handwritten_ocppmulti_control-from-outside-everest:
@@ -308,7 +264,8 @@ described under `Configuration access`_), DataTransfer, and the stack state
 OCPPmulti publishes. Its documentation and the generated API reference it
 links to are authoritative for the exact commands, variables and payloads.
 
-The API is a trusted local integrator channel and is not rate-limited or
+The API is part of the local channel, see :ref:`Configuration access
+<handwritten_ocppmulti_configuration-access>`, and is not rate-limited or
 authenticated by OCPPmulti; expose it accordingly. Its writes are subject to
 the same validation as any other EVerest-side write, including the in-use
 network configuration protection described under
@@ -801,6 +758,8 @@ In addition, the charging station periodically (by default every seven days) upd
 certificates of the V2G certificate chain. The cached OCSP response can be used as part of the ISO 15118 TLS
 handshake with EVs. An update is attempted at every startup and then on the periodic interval.
 
+.. _handwritten_ocppmulti_configuration-access:
+
 Configuration access
 ====================
 
@@ -824,11 +783,13 @@ OCPP configuration can be read, written and monitored through three channels:
   <handwritten_ocppmulti_control-from-outside-everest>`, and its own
   documentation for the full surface and the transport details.
 
-On the two EVerest-side channels, addressing and semantics are identical,
+The two EVerest-side channels together are the *local channel*: the
+integrator's own code in the charging station, trusted by OCPPmulti, as
+opposed to the CSMS. On both, addressing and semantics are identical,
 regardless of whether OCPP 1.6 or 2.x is active. The CSMS channel
 uses whatever the active protocol version prescribes (configuration keys in
-1.6, component/variable in 2.x); the rest of this section covers the
-EVerest-side channels.
+1.6, component/variable in 2.x); the rest of this section covers the local
+channel.
 
 Reading and writing (canonical form)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -869,9 +830,15 @@ are **currently not** carried on this interface; its result has no ``statusInfo`
 in either protocol mode. A rejected write therefore has to be diagnosed from the
 module log, which names the reason code and the offending component/variable.
 
-``ReadOnly`` mutability constrains the CSMS, not these channels: ``set_variables``
-also writes ``ReadOnly`` variables, e.g. ``InternalCtrlr``/``ChargePointModel``,
-in both protocol modes. In OCPP 1.6 mode, keys whose value the stack computes stay
+``ReadOnly`` mutability constrains the CSMS, not the local channel: ``set_variables``
+also writes ``ReadOnly`` variables of the component configuration, e.g.
+``InternalCtrlr``/``ChargePointModel``, in both protocol modes. A variable that a
+runtime owner registered is written through its owner, like the CSMS writes it,
+and only when it is ``ReadWrite``: a module configuration view or DER ``Enabled``
+is written, a ``ReadOnly`` one such as ``EVSE``/``Power`` is a value the owner
+reports and is ``Rejected``, see
+:ref:`How the device model is composed <everest_modules_handwritten_OCPPmulti_device_model>`.
+In OCPP 1.6 mode, keys whose value the stack computes stay
 ``Rejected``, e.g. ``NumberOfConnectors``, ``SupportedFeatureProfiles`` or
 ``SupportedMeasurands``. ``CentralSystemURI`` is one of them: change the CSMS URL
 through ``NetworkConfiguration``/``OcppCsmsUrl`` of a slot that is not in use, as in
@@ -887,7 +854,8 @@ Addressing rules:
 
 - Standard OCPP 2.x variables: their standard component (``OCPPCommCtrlr``,
   ``SecurityCtrlr``, ...). Works for the same datum in both protocol modes.
-- 1.6-only/vendor keys: component ``OCPP16LegacyCtrlr``, variable = key name.
+- 1.6-only/vendor keys: component ``OCPP16LegacyCtrlr``, variable = key name,
+  unless the mapping file replaces the mapping of the key (see below).
 - Custom-mapped keys (station-specific YAML): the mapped component/variable
   from the mapping file.
 - The deprecation warning emitted for legacy requests names the canonical
@@ -1084,11 +1052,11 @@ override on the active slot (B09.FR.26/27), so the new global value is what the
 next connection attempt uses - even when a legacy migration had populated the
 per-slot value. ``BasicAuthPassword`` is write-only; reads do not return it.
 
-``set_variables`` on this API may write ReadOnly variables: it is a trusted
-local integrator channel, and ReadOnly mutability models the CSMS-facing
-contract, not this API (the protection above still applies regardless of
-mutability). Some cells are nevertheless stack-owned runtime state, written on
-every successful connect; writing them here desyncs the device model from the
+``set_variables`` on this API may write ReadOnly variables: it is the local
+channel, and ReadOnly mutability models the CSMS-facing contract, not this
+API (the protection above still applies regardless of mutability). Some cells
+are nevertheless stack-owned runtime state, written on every successful
+connect; writing them here desyncs the device model from the
 connection logic. Do not write:
 
 - ``OCPPCommCtrlr``/``ActiveNetworkProfile`` - reports which slot is in use;
@@ -1184,11 +1152,11 @@ address. This form is not accepted when OCPP 2.x is active (returns
 to canonical addressing. Requests with a non-empty component name are never
 reinterpreted as configuration keys.
 
-Behavioral difference to the legacy OCPP module
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Behavioral difference to the removed OCPP module
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The legacy ``OCPP`` module ignores ``component.name`` entirely and always
-treats ``variable.name`` as a configuration key. OCPPmulti resolves the
+The removed ``OCPP`` module ignored ``component.name`` entirely and always
+treated ``variable.name`` as a configuration key. OCPPmulti resolves the
 component: a request whose non-empty component name is not a known address
 returns ``UnknownComponent`` instead of being treated as a key, and a
 ``monitor_variables`` registration with such an address never fires.

@@ -72,8 +72,10 @@ class ChargePointInterface {
 public:
     virtual ~ChargePointInterface() = default;
 
-    /// \brief Starts the ChargePoint, initializes and connects to the Websocket endpoint
-    /// \param bootreason  Optional bootreason (default: PowerUp).
+    /// \brief Starts the ChargePoint, initializes and connects to the Websocket endpoint. Removes the monitors and
+    /// stored values of variables that are absent from the device model, so every runtime owner must have registered
+    /// its components before.
+    /// \param bootreason  Optional bootreason (default: PowerUp)
     /// \param start_connecting Optional, set to false to initialize but not start connecting. Otherwise will connect to
     /// the first network profile. (default: true)
     virtual void start(BootReasonEnum bootreason = BootReasonEnum::PowerUp, bool start_connecting = true) = 0;
@@ -135,11 +137,12 @@ public:
     ///        called during a Firmware Update to indicate the current firmware_update_status.
     /// \param request_id   The request_id. When it is -1, it will not be included in the request.
     /// \param firmware_update_status The firmware_update_status
-    /// \param disable_connectors_during_install By default, all connectors will be disabled before installing the
-    /// firmware update. Setting this parameter to false will keep the connectors available during the update.
-    virtual void on_firmware_update_status_notification(std::int32_t request_id,
-                                                        const FirmwareStatusEnum& firmware_update_status,
-                                                        const bool disable_connectors_during_install = true) = 0;
+    /// \param disable_connectors_during_install Whether all connectors should be made unavailable (disabled) for the
+    /// duration of the firmware install. Keep unset to use the defaults (disable connectors in the Downloaded and
+    /// SignatureVerified phases for unsigned and signed updates respectively)
+    virtual void
+    on_firmware_update_status_notification(std::int32_t request_id, const FirmwareStatusEnum& firmware_update_status,
+                                           std::optional<bool> disable_connectors_during_install = std::nullopt) = 0;
 
     /// \brief Sends a NotifyDERAlarm to the CSMS for a DER grid event. No-op if no EVSE declares DER support.
     virtual void on_der_alarm(const ocpp::v21::NotifyDERAlarmRequest& request) = 0;
@@ -337,7 +340,11 @@ public:
     get_variables(const std::vector<GetVariableData>& get_variable_data_vector) = 0;
 
     /// \brief Sets variables specified within \p set_variable_data_vector in the device model and returns the result.
+    ///        This is the local channel, the integrator's own code rather than the CSMS: a ReadOnly variable of the
+    ///        component config may be written, and a variable that a runtime owner registered is written through its
+    ///        owner and only when it is ReadWrite, see DeviceModelInterface::set_local_value
     /// \param set_variable_data_vector contains data of the variables to set
+    /// \param source who sets the values, 'webinterface' for example
     /// \return Map containing the SetVariableData as a key and the  SetVariableResult as a value for each requested
     /// change
     virtual std::map<SetVariableData, SetVariableResult>
@@ -438,6 +445,9 @@ private:
     std::atomic<UploadLogStatusEnum> upload_log_status{UploadLogStatusEnum::Idle};
     std::atomic<std::int32_t> upload_log_status_id;
     BootReasonEnum bootreason{BootReasonEnum::PowerUp};
+    /// \brief The first start removes the monitors and stored values of absent variables. A later one, a restart,
+    /// does not: an owner may be between unregistering and registering again then.
+    bool absent_variables_removed{false};
     bool skip_invalid_csms_certificate_notifications{false};
 
     /// \brief Component responsible for maintaining and persisting the operational status of CS, EVSEs, and connectors.
@@ -528,7 +538,9 @@ public:
     /// \param evse_connector_structure Map that defines the structure of EVSE and connectors of the chargepoint. The
     /// key represents the id of the EVSE and the value represents the number of connectors for this EVSE. The ids of
     /// the EVSEs have to increment starting with 1.
-    /// \param device_model device model instance
+    /// \param device_model device model instance. It must define the AvailabilityState of the charging station and of
+    /// every EVSE and connector of \p evse_connector_structure, in its component config or registered before;
+    /// register_availability_states registers them on a DeviceModel. check_integrity reports a missing one.
     /// \param database_handler database handler instance
     /// \param evse_security Pointer to evse_security that manages security related operations
     /// \param connectivity_manager connectivity manager instance
@@ -545,7 +557,9 @@ public:
     /// \param evse_connector_structure Map that defines the structure of EVSE and connectors of the chargepoint. The
     /// key represents the id of the EVSE and the value represents the number of connectors for this EVSE. The ids of
     /// the EVSEs have to increment starting with 1.
-    /// \param device_model device model instance
+    /// \param device_model device model instance. It must define the AvailabilityState of the charging station and of
+    /// every EVSE and connector of \p evse_connector_structure, in its component config or registered before;
+    /// register_availability_states registers them on a DeviceModel. check_integrity reports a missing one.
     /// \param database_handler database handler instance
     /// \param message_queue message queue instance
     /// \param message_log_path Path to where logfiles are written to
@@ -615,9 +629,9 @@ public:
     void on_websocket_connection_failed(ConnectionFailedReason reason) override;
     void on_network_disconnected(OCPPInterfaceEnum ocpp_interface) override;
 
-    void on_firmware_update_status_notification(std::int32_t request_id,
-                                                const FirmwareStatusEnum& firmware_update_status,
-                                                bool disable_connectors_during_install = true) override;
+    void on_firmware_update_status_notification(
+        std::int32_t request_id, const FirmwareStatusEnum& firmware_update_status,
+        std::optional<bool> disable_connectors_during_install = std::nullopt) override;
 
     void on_der_alarm(const ocpp::v21::NotifyDERAlarmRequest& request) override;
 

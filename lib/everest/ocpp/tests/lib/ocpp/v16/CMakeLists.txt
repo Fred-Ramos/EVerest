@@ -16,6 +16,7 @@ target_sources(libocpp_unit_tests PRIVATE
         v2config/test_security.cpp
         v2config/test_smart_charging.cpp
         v2config/test_integrity.cpp
+        v2config/test_legacy_key_override.cpp
         v2config/test_user_config.cpp
         profile_tests_common.cpp
         profile_testsA.cpp
@@ -36,6 +37,7 @@ target_sources(libocpp_unit_tests PRIVATE
         test_charge_point_stop_transaction_auth_cache.cpp
         test_charge_point_change_configuration.cpp
         test_charge_point_firmware_status.cpp
+        test_charge_point_firmware_connectors.cpp
         test_config_validation.cpp
         utils_tests.cpp
         test_configuration.cpp

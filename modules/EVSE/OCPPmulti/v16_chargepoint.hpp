@@ -8,6 +8,7 @@
 #include "v16_variable_access.hpp"
 
 #include <everest/conversions/ocpp/evse_security_ocpp.hpp>
+#include <everest/ocpp_module_common/device_model/device_model_registrations.hpp>
 #include <everest/util/async/monitor.hpp>
 #include <ocpp/v16/charge_point_configuration_devicemodel.hpp>
 #include <ocpp/v16/variable_resolver.hpp>
@@ -20,10 +21,11 @@ namespace ocpp_multi {
 class ChargePointV16 : public GenericChargePointInterface {
 private:
     std::shared_ptr<EvseSecurity> m_evse_security;
+    // declared before m_variable_access, which holds a reference to the configuration's resolver
     std::unique_ptr<ocpp::v16::ChargePointConfigurationDeviceModel> m_charge_point_configuration;
-    ocpp::v2::Ocpp16KeyMappings m_custom_mappings;
-    // resolver must outlive m_variable_access, which holds a reference to it
-    std::optional<ocpp::v16::VariableResolver> m_variable_resolver;
+    // With the device model of m_charge_point_configuration: end_device_model_registrations() ends them before that
+    // device model is replaced or destroyed
+    ocpp_module_common::device_model::DeviceModelRegistrations m_device_model_registrations;
     std::optional<V16VariableAccess> m_variable_access;
     std::unique_ptr<ocpp::v16::ChargePoint> m_charge_point;
     ocpp_multi::GenericChargePointCallbacks* m_callbacks_ptr{nullptr};
@@ -54,14 +56,23 @@ private:
         std::string ocpp16_key_mappings_path;
         std::int32_t ocpp16_network_config_slot;
         bool enable_legacy_config_migration;
-        // Registered as source "EVEREST" in the composed device model storage, next to the SQLite-backed
-        // "OCPP" source; same composition as the OCPP 2.x path.
-        std::shared_ptr<ocpp_module_common::device_model::EverestDeviceModelStorage> everest_device_model;
+        // EVerest device model database of earlier versions, taken over at the first start
+        std::string everest_device_model_database_path;
+        bool fail_on_device_model_conflicts;
     };
 
     void check_configured(const std::string_view& fn);
+    /// \brief Ends the registrations with the device model and destroys the charge point, before the device model is
+    /// replaced or destroyed. The registrations end first: a value reported afterwards would reach the variable
+    /// listeners of the destroyed charge point.
+    void end_device_model_registrations() {
+        m_device_model_registrations.end();
+        m_charge_point.reset();
+    }
     void configure_callbacks();
-    void configure_data_model(const config_info_t& config);
+    void configure_data_model(const config_info_t& config,
+                              ocpp_module_common::device_model::EverestDeviceModel* everest_device_model,
+                              ocpp_module_common::device_model::ConfigServiceAccess* config_service);
     std::optional<evse_connector_t> evse_from_ocpp_connector(std::int32_t ocpp_connector_id) const;
 
     void cb_boot_notification_response(const ocpp::v16::BootNotificationResponse& boot_notification_response);
@@ -106,6 +117,13 @@ public:
     explicit ChargePointV16(ocpp_multi::GenericChargePointCallbacks& callbacks, evse_securityIntf& security) :
         m_evse_security(std::make_unique<EvseSecurity>(security)), m_callbacks_ptr(&callbacks) {
     }
+    ~ChargePointV16() {
+        end_device_model_registrations();
+    }
+    ChargePointV16(const ChargePointV16&) = delete;
+    ChargePointV16& operator=(const ChargePointV16&) = delete;
+    ChargePointV16(ChargePointV16&&) = delete;
+    ChargePointV16& operator=(ChargePointV16&&) = delete;
 
     // ------------------------------------------------------------------------
     // GenericChargePointConfiguration
@@ -181,9 +199,9 @@ public:
 
     void on_fault_cleared(std::int32_t evse_id, std::int32_t connector_id) override;
     void on_faulted(std::int32_t evse_id, std::int32_t connector_id) override;
-    void on_firmware_update_status_notification(std::int32_t request_id,
-                                                ocpp::v2::FirmwareStatusEnum firmware_update_status,
-                                                bool disable_connectors_during_install = true) override;
+    void on_firmware_update_status_notification(
+        std::int32_t request_id, ocpp::v2::FirmwareStatusEnum firmware_update_status,
+        std::optional<bool> disable_connectors_during_install = std::nullopt) override;
     void on_get_15118_ev_certificate_request(std::int32_t extensions_id,
                                              const ocpp::v2::Get15118EVCertificateRequest& request) override;
     void on_log_status_notification(ocpp::v2::UploadLogStatusEnum status, std::int32_t requestId) override;

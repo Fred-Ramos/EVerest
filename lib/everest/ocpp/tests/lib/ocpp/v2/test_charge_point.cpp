@@ -814,6 +814,78 @@ public:
     }
 };
 
+TEST_F(ChargePointCommonTestFixtureV2, FirmwareNotificationGuardTracksCycleBoundaries) {
+    configure_callbacks_with_mocks();
+    testing::MockFunction<void()> all_connectors_unavailable;
+    callbacks.all_connectors_unavailable_callback = all_connectors_unavailable.AsStdFunction();
+    auto database_handler = create_database_handler();
+    TestChargePoint charge_point(create_evse_connector_structure(), device_model, database_handler,
+                                 create_message_queue(database_handler), TEMP_OUTPUT_PATH,
+                                 std::make_shared<EvseSecurityMock>(), callbacks);
+    charge_point.start();
+
+    EXPECT_CALL(all_connectors_unavailable, Call()).Times(1);
+    charge_point.on_firmware_update_status_notification(1, FirmwareStatusEnum::InstallScheduled, true);
+    charge_point.on_firmware_update_status_notification(1, FirmwareStatusEnum::InstallScheduled, true);
+    testing::Mock::VerifyAndClearExpectations(&all_connectors_unavailable);
+
+    charge_point.on_firmware_update_status_notification(1, FirmwareStatusEnum::Idle);
+    EXPECT_CALL(all_connectors_unavailable, Call()).Times(1);
+    charge_point.on_firmware_update_status_notification(1, FirmwareStatusEnum::InstallScheduled, true);
+    testing::Mock::VerifyAndClearExpectations(&all_connectors_unavailable);
+
+    charge_point.on_firmware_update_status_notification(1, FirmwareStatusEnum::Installed);
+    EXPECT_CALL(all_connectors_unavailable, Call()).Times(1);
+    charge_point.on_firmware_update_status_notification(2, FirmwareStatusEnum::InstallScheduled, true);
+    charge_point.stop();
+}
+
+TEST_F(ChargePointCommonTestFixtureV2, RejectedDeferredRequestRearmsInstallNotification) {
+    configure_callbacks_with_mocks();
+    testing::MockFunction<void()> all_connectors_unavailable;
+    callbacks.all_connectors_unavailable_callback = all_connectors_unavailable.AsStdFunction();
+    const auto& defer_cv = ControllerComponentVariables::DeferFirmwareDownloadDuringTransaction;
+    ASSERT_EQ(device_model->set_value(defer_cv.component, defer_cv.variable.value(), AttributeEnum::Actual, "true",
+                                      "TEST", true),
+              SetVariableStatusEnum::Accepted);
+    auto database_handler = create_database_handler();
+    TestChargePoint charge_point(create_evse_connector_structure(), device_model, database_handler,
+                                 create_message_queue(database_handler), TEMP_OUTPUT_PATH,
+                                 std::make_shared<EvseSecurityMock>(), callbacks);
+    charge_point.start();
+
+    EXPECT_CALL(all_connectors_unavailable, Call()).Times(1);
+    charge_point.on_firmware_update_status_notification(1, FirmwareStatusEnum::InstallScheduled, true);
+    testing::Mock::VerifyAndClearExpectations(&all_connectors_unavailable);
+
+    const ocpp::DateTime timestamp("2024-01-17T17:00:00");
+    charge_point.on_transaction_started(1, 1, "some-session-id", timestamp, TriggerReasonEnum::Authorized, MeterValue(),
+                                        {}, {}, {}, {}, ChargingStateEnum::EVConnected);
+
+    UpdateFirmwareRequest request;
+    request.requestId = 2;
+    request.firmware.location = "https://firmware.example.com/firmware.bin";
+    request.firmware.retrieveDateTime = ocpp::DateTime("2024-01-01T00:00:00Z");
+    ocpp::EnhancedMessage<MessageType> update_firmware;
+    update_firmware.messageType = MessageType::UpdateFirmware;
+    update_firmware.message = ocpp::Call<UpdateFirmwareRequest>(request);
+    EXPECT_CALL(update_firmware_request_callback_mock, Call(testing::_)).Times(0);
+    charge_point.handle_message(update_firmware);
+    testing::Mock::VerifyAndClearExpectations(&update_firmware_request_callback_mock);
+
+    UpdateFirmwareResponse rejected;
+    rejected.status = UpdateFirmwareStatusEnum::Rejected;
+    EXPECT_CALL(update_firmware_request_callback_mock, Call(testing::_)).WillOnce(testing::Return(rejected));
+    charge_point.on_transaction_finished(1, timestamp, MeterValue(), ReasonEnum::StoppedByEV,
+                                         TriggerReasonEnum::StopAuthorized, {}, {}, ChargingStateEnum::EVConnected);
+    testing::Mock::VerifyAndClearExpectations(&update_firmware_request_callback_mock);
+
+    EXPECT_CALL(all_connectors_unavailable, Call()).Times(1);
+    charge_point.on_firmware_update_status_notification(3, FirmwareStatusEnum::InstallScheduled, true);
+    testing::Mock::VerifyAndClearExpectations(&all_connectors_unavailable);
+    charge_point.stop();
+}
+
 class ChargePointFunctionalityTestFixtureV2 : public ChargePointCommonTestFixtureV2 {
 public:
     ChargePointFunctionalityTestFixtureV2() :
@@ -1130,6 +1202,84 @@ TEST_F(ChargePointConstructorTestFixtureV2, StopKeepsConnectionCallbacksArmed) {
 
     // Verify while still alive: destruction is the only disarm site.
     ::testing::Mock::VerifyAndClearExpectations(connectivity_manager.get());
+}
+
+namespace {
+RegisteredComponent make_extension_component() {
+    RegisteredComponent registered;
+    registered.component.name = "ExtensionCtrlr";
+    RegisteredVariable level;
+    level.variable.name = "Level";
+    level.characteristics.dataType = DataEnum::integer;
+    level.characteristics.supportsMonitoring = true;
+    VariableAttribute attribute;
+    attribute.mutability = MutabilityEnum::ReadWrite;
+    attribute.value = "10";
+    level.attributes = {attribute};
+    registered.variables = {level};
+    return registered;
+}
+
+std::size_t monitor_count(DeviceModel& device_model, const RegisteredComponent& registered) {
+    std::size_t count = 0;
+    for (const auto& data :
+         device_model.get_monitors({}, {{registered.component, registered.variables.at(0).variable}})) {
+        count += data.variableMonitoring.size();
+    }
+    return count;
+}
+
+SetMonitoringData make_upper_threshold_monitor(const RegisteredComponent& registered) {
+    SetMonitoringData request;
+    request.component = registered.component;
+    request.variable = registered.variables.at(0).variable;
+    request.type = MonitorEnum::UpperThreshold;
+    request.value = 50;
+    request.severity = 3;
+    return request;
+}
+} // namespace
+
+TEST_F(ChargePointConstructorTestFixtureV2, StartRemovesMonitorsOfAbsentVariables) {
+    configure_callbacks_with_mocks();
+    auto connectivity_manager = std::make_shared<::testing::NiceMock<ConnectivityManagerMock>>();
+    ON_CALL(*connectivity_manager, is_websocket_connected()).WillByDefault(::testing::Return(false));
+
+    const std::string owner = "EXT:extension";
+    const auto registered = make_extension_component();
+    ASSERT_TRUE(device_model->register_components(owner, {registered}, nullptr).rejected.empty());
+    ASSERT_EQ(device_model->set_monitors({make_upper_threshold_monitor(registered)}).at(0).status,
+              SetMonitoringStatusEnum::Accepted);
+    device_model->unregister_components(owner);
+
+    ocpp::v2::ChargePoint charge_point(evse_connector_structure, device_model, database_handler, evse_security,
+                                       connectivity_manager, "/tmp", callbacks);
+    charge_point.start(BootReasonEnum::PowerUp);
+    charge_point.stop();
+    ASSERT_TRUE(device_model->register_components(owner, {registered}, nullptr).rejected.empty());
+    EXPECT_EQ(monitor_count(*device_model, registered), 0);
+}
+
+TEST_F(ChargePointConstructorTestFixtureV2, RestartKeepsMonitorsOfUnregisteredVariables) {
+    configure_callbacks_with_mocks();
+    auto connectivity_manager = std::make_shared<::testing::NiceMock<ConnectivityManagerMock>>();
+    ON_CALL(*connectivity_manager, is_websocket_connected()).WillByDefault(::testing::Return(false));
+
+    const std::string owner = "EXT:extension";
+    const auto registered = make_extension_component();
+    ASSERT_TRUE(device_model->register_components(owner, {registered}, nullptr).rejected.empty());
+    ocpp::v2::ChargePoint charge_point(evse_connector_structure, device_model, database_handler, evse_security,
+                                       connectivity_manager, "/tmp", callbacks);
+    charge_point.start(BootReasonEnum::PowerUp);
+    ASSERT_EQ(device_model->set_monitors({make_upper_threshold_monitor(registered)}).at(0).status,
+              SetMonitoringStatusEnum::Accepted);
+    charge_point.stop();
+
+    device_model->unregister_components(owner);
+    charge_point.start(BootReasonEnum::ApplicationReset);
+    charge_point.stop();
+    ASSERT_TRUE(device_model->register_components(owner, {registered}, nullptr).rejected.empty());
+    EXPECT_EQ(monitor_count(*device_model, registered), 1);
 }
 
 // The use-after-free is at destruction: a deferred callback landing while members are destroyed. The

@@ -2,17 +2,20 @@
 // Copyright Pionix GmbH and Contributors to EVerest
 #include "charge_point_config_factory_v16.hpp"
 
+#include <everest/ocpp_module_common/device_model/device_model_conflicts.hpp>
+#include <everest/ocpp_module_common/device_model/everest_device_model.hpp>
+
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
-#include <everest/ocpp_module_common/device_model/composed_device_model_storage.hpp>
-
+#include <ocpp/common/utils.hpp>
 #include <ocpp/v16/charge_point_configuration.hpp>
 #include <ocpp/v16/charge_point_configuration_devicemodel.hpp>
 #include <ocpp/v2/ctrlr_component_variables.hpp>
@@ -55,7 +58,8 @@ struct DeviceModelInitializationContext {
     fs::path database_path;
     fs::path migration_files_path;
     fs::path component_config_path;
-    std::optional<fs::path> custom_mappings_path;
+    // loaded once, so the migration and the device model configuration log the file's problems once
+    ocpp::v2::Ocpp16KeyMappings custom_mappings;
     std::int32_t ocpp16_network_config_slot{1};
 };
 
@@ -97,7 +101,8 @@ DeviceModelInitializationContext resolve_device_model_initialization_context(con
             EVLOG_AND_THROW(std::runtime_error(
                 fmt::format("Could not locate OCPP 1.6 key mapping file at '{}'.", config.Ocpp16KeyMappingsPath)));
         }
-        context.custom_mappings_path = custom_mappings_path.value();
+        EVLOG_info << "Custom OCPP 1.6 key mappings provided, loading from " << custom_mappings_path.value();
+        context.custom_mappings = ocpp::v2::load_ocpp16_key_mappings_from_yaml(custom_mappings_path.value());
     }
 
     context.ocpp16_network_config_slot = static_cast<int32_t>(config.Ocpp16NetworkConfigSlot);
@@ -113,9 +118,9 @@ void patch_number_of_connectors(
     constexpr auto number_of_connectors_var = "NumberOfConnectors";
 
     for (auto& [component_key, variables] : component_configs) {
-        if (component_key.name == legacy_ctrlr_name) {
+        if (ocpp::iequals(component_key.name, legacy_ctrlr_name)) {
             for (auto& variable : variables) {
-                if (variable.name == number_of_connectors_var) {
+                if (ocpp::iequals(variable.name, number_of_connectors_var)) {
                     for (auto& attribute : variable.attributes) {
                         if (attribute.variable_attribute.type == ocpp::v2::AttributeEnum::Actual) {
                             attribute.value_source = "OCPP16Config";
@@ -137,6 +142,7 @@ void initialize_device_model_direct(const DeviceModelInitializationContext& cont
     EVLOG_info << "Updating device model database from component configs.";
     auto component_configs = ocpp::v2::get_all_component_configs(context.component_config_path);
     ocpp::v2::ensure_ocpp16_legacy_ctrlr(component_configs);
+    ocpp::v2::remove_overridden_ocpp16_legacy_variables(component_configs, context.custom_mappings);
     patch_number_of_connectors(component_configs, n_evse);
     ocpp::v2::InitDeviceModelDb init_device_model_db(context.database_path, context.migration_files_path);
     init_device_model_db.initialize_database(component_configs, false);
@@ -159,14 +165,9 @@ void initialize_device_model_with_migration(const fs::path& ocpp_share_path, con
     auto component_configs = ocpp::v2::get_all_component_configs(context.component_config_path);
     ocpp::v2::ensure_ocpp16_legacy_ctrlr(component_configs);
 
-    ocpp::v2::Ocpp16KeyMappings custom_mappings;
-    if (context.custom_mappings_path.has_value()) {
-        EVLOG_info << "Custom OCPP 1.6 key mappings provided, loading from " << context.custom_mappings_path.value();
-        custom_mappings = ocpp::v2::load_ocpp16_key_mappings_from_yaml(context.custom_mappings_path.value());
-    }
-
-    ocpp::v2::patch_component_config_with_ocpp16(component_configs, *legacy_charge_point_config, custom_mappings,
-                                                 context.ocpp16_network_config_slot);
+    ocpp::v2::patch_component_config_with_ocpp16(component_configs, *legacy_charge_point_config,
+                                                 context.custom_mappings, context.ocpp16_network_config_slot);
+    ocpp::v2::remove_overridden_ocpp16_legacy_variables(component_configs, context.custom_mappings);
 
     ocpp::v2::InitDeviceModelDb init_device_model_db(context.database_path, context.migration_files_path);
     init_device_model_db.initialize_database(component_configs, false);
@@ -176,26 +177,38 @@ void initialize_device_model_with_migration(const fs::path& ocpp_share_path, con
 
 config_factory_result_t create_device_model_charge_point_configuration(
     const fs::path& ocpp_share_path, const DeviceModelInitializationContext& context,
-    std::shared_ptr<ocpp::v2::DeviceModelStorageInterface> everest_device_model) {
+    const fs::path& everest_device_model_database_path,
+    ocpp_module_common::device_model::EverestDeviceModel* everest_device_model,
+    ocpp_module_common::device_model::ConfigServiceAccess* config_service, const std::int32_t n_evse,
+    const bool fail_on_device_model_conflicts) {
     // The database is pre-seeded by initialize_device_model_* above, so the 1-arg ctor is correct here.
-    auto ocpp_device_model_storage = std::make_shared<ocpp::v2::DeviceModelStorageSqlite>(context.database_path);
-    // Same composition as the OCPP 2.x path (ChargePointV2::init): sources "OCPP" + "EVEREST".
-    auto composed_device_model_storage = ocpp_module_common::device_model::make_composed_device_model_storage(
-        std::move(ocpp_device_model_storage), std::move(everest_device_model));
-    auto device_model = std::make_unique<ocpp::v2::DeviceModel>(std::move(composed_device_model_storage));
+    auto device_model_storage = std::make_unique<ocpp::v2::DeviceModelStorageSqlite>(context.database_path);
+    ocpp_module_common::device_model::migrate_everest_device_model_database(
+        everest_device_model_database_path, context.database_path, *device_model_storage);
+    auto device_model = std::make_unique<ocpp::v2::DeviceModel>(std::move(device_model_storage));
 
     // One-time migration, mirroring the v2 path (ocpp::v2::ChargePoint::initialize)
     ocpp::v2::NetworkConfigurationComponentVariables::migrate_from_blob_if_needed(*device_model);
 
-    ocpp::v2::Ocpp16KeyMappings custom_mappings;
-    if (context.custom_mappings_path.has_value()) {
-        custom_mappings = ocpp::v2::load_ocpp16_key_mappings_from_yaml(context.custom_mappings_path.value());
-    }
-
-    // Pass a copy so the returned mappings match the ones the configuration runs with.
+    // Register only once the configuration owns the device model, so the registrations end before it is destroyed
+    auto& registry = *device_model;
     auto configuration = std::make_unique<ocpp::v16::ChargePointConfigurationDeviceModel>(
-        ocpp_share_path.string(), std::move(device_model), custom_mappings);
-    return {std::move(configuration), std::move(custom_mappings)};
+        ocpp_share_path.string(), std::move(device_model), context.custom_mappings);
+
+    ocpp_module_common::device_model::DeviceModelRegistrations registrations;
+    if (everest_device_model != nullptr) {
+        registrations.register_everest_device_model(*everest_device_model, registry);
+    }
+    if (config_service != nullptr) {
+        registrations.register_config_service(*config_service, registry);
+    }
+    // Also removes the monitors and stored values of variables registered in OCPP 2.x mode only, such as DER
+    registry.remove_monitors_and_values_of_absent_variables();
+    ocpp_module_common::device_model::check_device_model_conflicts(registrations.results(),
+                                                                   fail_on_device_model_conflicts);
+    configuration->check_integrity(n_evse);
+
+    return {std::move(configuration), std::move(registrations)};
 }
 
 /// \brief Loads the legacy OCPP 1.6 JSON config used as the one-time device-model migration source.
@@ -241,8 +254,9 @@ std::string load_charge_point_config_json(const fs::path& configured_config_path
 
 config_factory_result_t
 create_charge_point_configuration(const fs::path& ocpp_share_path, const Ocpp16DeviceModelParams& config,
-                                  std::int32_t n_evse,
-                                  std::shared_ptr<ocpp::v2::DeviceModelStorageInterface> everest_device_model) {
+                                  std::int32_t n_evse, const fs::path& everest_device_model_database_path,
+                                  ocpp_module_common::device_model::EverestDeviceModel* everest_device_model,
+                                  ocpp_module_common::device_model::ConfigServiceAccess* config_service) {
     const auto context = resolve_device_model_initialization_context(ocpp_share_path, config);
 
     const bool db_initialized =
@@ -272,10 +286,9 @@ create_charge_point_configuration(const fs::path& ocpp_share_path, const Ocpp16D
         initialize_device_model_direct(context, n_evse);
     }
 
-    auto result =
-        create_device_model_charge_point_configuration(ocpp_share_path, context, std::move(everest_device_model));
-    result.configuration->check_integrity(n_evse);
-    return result;
+    return create_device_model_charge_point_configuration(ocpp_share_path, context, everest_device_model_database_path,
+                                                          everest_device_model, config_service, n_evse,
+                                                          config.FailOnDeviceModelConflicts);
 }
 
 } // namespace module::config_factory_v16

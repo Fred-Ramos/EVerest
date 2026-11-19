@@ -25,6 +25,42 @@ config:
       keep connectors available and must not interrupt ongoing sessions).
     type: boolean
     default: true
+  DiagnosticsLogDirectory:
+    description: >-
+      Directory with the log files to upload for a diagnostics log request (OCPP GetLog with logType DiagnosticsLog,
+      or OCPP 1.6 GetDiagnostics). The files whose entries fall into the requested time range, judged by their
+      modification times, are packed into one .tar.gz and uploaded. A request with no such file is rejected.
+      Empty, the default, uploads a placeholder file instead.
+    type: string
+    default: ""
+  DiagnosticsLogFileFilter:
+    description: >-
+      Only the files in DiagnosticsLogDirectory whose name contains this text are uploaded. Empty, the default, takes
+      every file.
+    type: string
+    default: ""
+  SecurityLogDirectory:
+    description: >-
+      Directory with the security log files to upload for a security log request (OCPP GetLog with logType
+      SecurityLog), e.g. the OCPP module's MessageLogPath, where libocpp writes its security events when
+      LogMessagesFormat contains "security". Files are picked and packed as for DiagnosticsLogDirectory.
+      Empty, the default, uploads a placeholder file instead.
+    type: string
+    default: ""
+  SecurityLogFileFilter:
+    description: >-
+      Only the files in SecurityLogDirectory whose name contains this text are uploaded. The default matches the
+      security log that libocpp writes, including its rotated files.
+    type: string
+    default: ".security.log"
+  LogUploadMaxSizeMB:
+    description: >-
+      Limit in MB on the log files put into one upload, counted before compression. When the requested time range
+      holds more, the oldest files are left out. The newest file is always uploaded, even if it alone is larger.
+      0, the default, sets no limit.
+    type: integer
+    minimum: 0
+    default: 0
 provides:
   main:
     description: Implements the system interface

@@ -57,9 +57,6 @@ ocpp::v2::Ocpp16KeyMappings custom_mappings_fixture() {
     ocpp::v2::Ocpp16KeyMappings mappings;
     mappings.emplace("VendorBar", std::make_pair(make_component("VendorCtrlr"), make_variable("BarSetting")));
     mappings.emplace("VendorEmpty", std::make_pair(make_component("VendorCtrlr"), make_variable("EmptySetting")));
-    // two custom keys mapping to the same CV -> ambiguous reverse
-    mappings.emplace("VendorFoo", std::make_pair(make_component("VendorCtrlr"), make_variable("FooSetting")));
-    mappings.emplace("VendorFooAlias", std::make_pair(make_component("VendorCtrlr"), make_variable("FooSetting")));
     return mappings;
 }
 
@@ -342,8 +339,8 @@ TEST_F(V16VariableAccess, freeCvWithoutValueReadsEmptyAndIsWritable) {
     EXPECT_EQ(m_device_model.entry(make_component("VendorCtrlr"), make_variable("UnsetSetting")).value, "first");
 }
 
-// Mirrors the 2.x consumer path (Provisioning::set_variables, allow_read_only=true): this API is a
-// trusted local channel, so ReadOnly mutability does not reject writes in either mode.
+// Mirrors the 2.x consumer path (Provisioning::set_variables, set_local_value): this API is the local channel,
+// so ReadOnly mutability does not reject writes to the component config in either mode.
 TEST_F(V16VariableAccess, freeCvReadOnlyMutabilityIsWritableLikeThe2xConsumerPath) {
     m_device_model.add(make_component("VendorCtrlr"), make_variable("FrozenSetting"), "fixed",
                        ocpp::v2::MutabilityEnum::ReadOnly);
@@ -355,7 +352,7 @@ TEST_F(V16VariableAccess, freeCvReadOnlyMutabilityIsWritableLikeThe2xConsumerPat
     ASSERT_TRUE(results[0].monitor_value.has_value());
     EXPECT_EQ(results[0].monitor_value.value(), "thawed");
     EXPECT_EQ(m_device_model.entry(make_component("VendorCtrlr"), make_variable("FrozenSetting")).value, "thawed");
-    // still routed through set_value (with allow_read_only), never set_read_only_value
+    // still routed through set_value (with allow_read_only_update), never set_read_only_value
     EXPECT_EQ(m_device_model.set_read_only_calls(), 0);
 }
 
@@ -771,32 +768,6 @@ TEST_F(V16VariableAccess, unknownComponentAndVariableAreDistinguished) {
     EXPECT_FALSE(set_results[0].monitor_value.has_value());
     EXPECT_EQ(set_results[1].result.attributeStatus, ocpp::v2::SetVariableStatusEnum::UnknownVariable);
     EXPECT_FALSE(set_results[1].monitor_value.has_value());
-}
-
-// ---- path 4: ambiguous reverse mapping ----
-
-TEST_F(V16VariableAccess, ambiguousCustomMappingIsRejected) {
-    auto access = make_access();
-
-    const auto get_results = access.get({make_get("VendorCtrlr", "FooSetting")});
-    ASSERT_EQ(get_results.size(), 1);
-    EXPECT_EQ(get_results[0].attributeStatus, ocpp::v2::GetVariableStatusEnum::Rejected);
-    ASSERT_TRUE(get_results[0].attributeStatusInfo.has_value());
-    EXPECT_EQ(get_results[0].attributeStatusInfo.value().reasonCode.get(), "AmbiguousMapping");
-    ASSERT_TRUE(get_results[0].attributeStatusInfo.value().additionalInfo.has_value());
-    EXPECT_EQ(get_results[0].attributeStatusInfo.value().additionalInfo.value().get(),
-              "Ambiguous custom key mapping; fix Ocpp16KeyMappingsPath");
-    EXPECT_EQ(m_get_keys_calls, 0);
-
-    const auto set_results = access.set({make_set("VendorCtrlr", "FooSetting", "x")}, "csms");
-    ASSERT_EQ(set_results.size(), 1);
-    EXPECT_EQ(set_results[0].result.attributeStatus, ocpp::v2::SetVariableStatusEnum::Rejected);
-    ASSERT_TRUE(set_results[0].result.attributeStatusInfo.has_value());
-    EXPECT_EQ(set_results[0].result.attributeStatusInfo.value().reasonCode.get(), "AmbiguousMapping");
-    ASSERT_TRUE(set_results[0].result.attributeStatusInfo.value().additionalInfo.has_value());
-    EXPECT_EQ(set_results[0].result.attributeStatusInfo.value().additionalInfo.value().get(),
-              "Ambiguous custom key mapping; fix Ocpp16KeyMappingsPath");
-    EXPECT_TRUE(m_set_calls.empty());
 }
 
 // ---- mixed batches keep request order and legacy population semantics ----

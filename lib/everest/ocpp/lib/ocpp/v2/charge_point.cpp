@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Pionix GmbH and Contributors to EVerest
 
+#include <ocpp/v2/availability_state_registration.hpp>
 #include <ocpp/v2/charge_point.hpp>
 
 #include <ocpp/common/constants.hpp>
@@ -36,6 +37,7 @@
 #include <ocpp/v2/messages/LogStatusNotification.hpp>
 #include <ocpp/v2/messages/RequestStopTransaction.hpp>
 #include <ocpp/v2/messages/TriggerMessage.hpp>
+#include <ocpp/v2/messages/UpdateFirmware.hpp>
 
 #include <optional>
 #include <stdexcept>
@@ -85,7 +87,9 @@ ChargePoint::ChargePoint(const std::map<std::int32_t, std::int32_t>& evse_connec
                          const std::string& sql_init_path, const std::string& message_log_path,
                          const std::shared_ptr<EvseSecurity> evse_security, const Callbacks& callbacks) :
     ChargePoint(
-        evse_connector_structure, std::make_shared<DeviceModel>(std::move(device_model_storage_interface)),
+        evse_connector_structure,
+        create_device_model_with_availability_states(evse_connector_structure,
+                                                     std::move(device_model_storage_interface)),
         std::make_shared<DatabaseHandler>(
             std::make_unique<everest::db::sqlite::Connection>(fs::path(core_database_path) / "cp.db"), sql_init_path),
         nullptr /* message_queue initialized in this constructor */, message_log_path, evse_security, callbacks,
@@ -120,6 +124,10 @@ void ChargePoint::start(BootReasonEnum bootreason, bool start_connecting) {
     }
 
     this->bootreason = bootreason;
+    if (not this->absent_variables_removed) {
+        this->device_model->remove_monitors_and_values_of_absent_variables();
+        this->absent_variables_removed = true;
+    }
     // Trigger all initial status notifications and callbacks related to component state
     // Should be done before sending the BootNotification.req so that the correct states can be reported
     this->component_state_manager->trigger_all_effective_availability_changed_callbacks();
@@ -183,7 +191,7 @@ void ChargePoint::on_network_disconnected(OCPPInterfaceEnum ocpp_interface) {
 
 void ChargePoint::on_firmware_update_status_notification(std::int32_t request_id,
                                                          const FirmwareStatusEnum& firmware_update_status,
-                                                         const bool disable_connectors_during_install) {
+                                                         std::optional<bool> disable_connectors_during_install) {
     this->firmware_update->on_firmware_update_status_notification(request_id, firmware_update_status,
                                                                   disable_connectors_during_install);
 }
@@ -485,9 +493,13 @@ void ChargePoint::initialize(const std::map<std::int32_t, std::int32_t>& evse_co
 
     // make sure number of connectors is set correctly
     const auto number_of_connectors_cv = ControllerComponentVariables::NumberOfConnectors;
-    this->device_model->set_value(number_of_connectors_cv.component, number_of_connectors_cv.variable.value(),
-                                  AttributeEnum::Actual, std::to_string(evse_connector_structure.size()),
-                                  VARIABLE_ATTRIBUTE_VALUE_SOURCE_INTERNAL, true);
+    if (this->device_model->set_value(number_of_connectors_cv.component, number_of_connectors_cv.variable.value(),
+                                      AttributeEnum::Actual, std::to_string(evse_connector_structure.size()),
+                                      VARIABLE_ATTRIBUTE_VALUE_SOURCE_INTERNAL,
+                                      true) != SetVariableStatusEnum::Accepted) {
+        EVLOG_warning << "Could not set " << number_of_connectors_cv.component << "."
+                      << number_of_connectors_cv.variable.value();
+    }
     this->device_model->check_integrity(evse_connector_structure);
     // One-time migration: if NetworkConnectionProfiles blob is non-empty, write into DM components and clear blob
     NetworkConfigurationComponentVariables::migrate_from_blob_if_needed(*this->device_model);
@@ -661,8 +673,16 @@ void ChargePoint::initialize(const std::map<std::int32_t, std::int32_t>& evse_co
 
     this->meter_values = std::make_unique<MeterValues>(*this->functional_block_context);
 
+    // The firmware update block limits the callback to once per update cycle
+    std::optional<AllConnectorsUnavailableCallback> guarded_all_connectors_unavailable_callback;
+    if (this->callbacks.all_connectors_unavailable_callback.has_value()) {
+        guarded_all_connectors_unavailable_callback = [this]() {
+            this->firmware_update->on_all_connectors_unavailable();
+        };
+    }
+
     this->availability = std::make_unique<Availability>(*functional_block_context, this->callbacks.time_sync_callback,
-                                                        this->callbacks.all_connectors_unavailable_callback);
+                                                        guarded_all_connectors_unavailable_callback);
 
     if (this->callbacks.configure_network_connection_profile_callback.has_value()) {
         this->connectivity_manager->set_configure_network_connection_profile_callback(
@@ -725,9 +745,12 @@ void ChargePoint::initialize(const std::map<std::int32_t, std::int32_t>& evse_co
 
     Variable field_length = {"FieldLength"};
     field_length.instance = "Get15118EVCertificateResponse.exiResponse";
-    this->device_model->set_value(ControllerComponents::OCPPCommCtrlr, field_length, AttributeEnum::Actual,
-                                  std::to_string(ISO15118_GET_EV_CERTIFICATE_EXI_RESPONSE_SIZE),
-                                  VARIABLE_ATTRIBUTE_VALUE_SOURCE_INTERNAL, true);
+    if (this->device_model->set_value(ControllerComponents::OCPPCommCtrlr, field_length, AttributeEnum::Actual,
+                                      std::to_string(ISO15118_GET_EV_CERTIFICATE_EXI_RESPONSE_SIZE),
+                                      VARIABLE_ATTRIBUTE_VALUE_SOURCE_INTERNAL,
+                                      true) != SetVariableStatusEnum::Accepted) {
+        EVLOG_warning << "Could not set " << ControllerComponents::OCPPCommCtrlr << "." << field_length;
+    }
 }
 
 void ChargePoint::build_der_control_if_enabled() {

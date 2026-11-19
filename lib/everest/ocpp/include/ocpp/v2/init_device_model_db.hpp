@@ -53,6 +53,9 @@ struct ComponentKey {
 
     ///
     /// \brief operator <, needed to add this class as key in a map.
+    ///
+    /// Orders by the name key of monitors and stored values: names and instances ignore case, an absent instance
+    /// equals an empty one and an absent EVSE or connector id equals 0.
     /// \param l ComponentKey to compare with another ComponentKey
     /// \param r Second componentKey to compare with the other ComponentKey
     /// \return True if 'l' is 'smaller' than r (should be placed before 'r').
@@ -89,9 +92,12 @@ struct DeviceModelVariable {
     std::optional<std::string> default_actual_value;
     /// \brief Config monitors, if any
     std::vector<VariableMonitoringMeta> monitors;
-    /// \brief Source of the variable.
-    std::optional<std::string> source;
 };
+
+///
+/// \brief Check if the two variables are the same given their unique properties (name and instance, ignoring case).
+///
+bool is_same_variable(const DeviceModelVariable& v1, const DeviceModelVariable& v2);
 
 /// \brief Convert from json to a ComponentKey struct.
 /// The to_json is not implemented as we don't need to write the component config to a json file.
@@ -123,19 +129,36 @@ private:
 };
 
 ///
+/// \brief A component config uses a name key that monitors and stored values cannot represent: an empty component
+/// or variable instance, or an EVSE or connector id of 0, and when two components or two variables of one component
+/// share a name key, which compares names and instances case-insensitively.
+///
+class ComponentConfigNameKeyError : public InitDeviceModelDbError {
+public:
+    using InitDeviceModelDbError::InitDeviceModelDbError;
+};
+
+///
 /// \brief Read all component config files from the given directory and create a map holding the structure.
 /// \param directory    The parent directory containing the standardized and custom component config files.
 /// \return A map with the device model components, variables, characteristics and attributes.
 ///
+/// \throws InitDeviceModelDbError if a component config is invalid, for example invalid JSON, a missing key, a wrong
+/// type or an unknown enum value, with the path of the file. No file is skipped:
+/// the standardized config of the same component would replace a skipped custom config, and the variables only the
+/// custom config defines would be removed with their monitors.
+/// \throws ComponentConfigNameKeyError if a component config uses a name key that monitors cannot represent
 std::map<ComponentKey, std::vector<DeviceModelVariable>>
 get_all_component_configs(const std::filesystem::path& directory);
 
 /// \brief Parse a component config JSON document into ComponentKey + variables.
-/// \throws InitDeviceModelDbError if "properties" missing.
+/// \throws InitDeviceModelDbError if "properties" missing; ComponentConfigNameKeyError for an empty instance or an
+/// EVSE or connector id of 0.
 std::pair<ComponentKey, std::vector<DeviceModelVariable>> parse_component_config_from_json(const json& data);
 
 /// \brief Parse a component config JSON document from a string.
-/// \throws nlohmann::json::parse_error on invalid JSON; InitDeviceModelDbError if "properties" missing.
+/// \throws nlohmann::json::parse_error on invalid JSON; InitDeviceModelDbError if "properties" missing;
+/// ComponentConfigNameKeyError for an empty instance or an EVSE or connector id of 0.
 std::pair<ComponentKey, std::vector<DeviceModelVariable>>
 parse_component_config_from_string(const std::string& json_content);
 
@@ -184,6 +207,7 @@ public:
     /// \throws InitDeviceModelDbError  - When database could not be initialized or
     ///                                 - Foreign keys could not be turned on or
     ///                                 - Something could not be added to, retrieved or removed from the database
+    /// \throws ComponentConfigNameKeyError When two variables of one component share a name key
     /// \throws MigrationException  If something went wrong during migration
     /// \throws ConnectionException If the database could not be opened
     ///
@@ -230,6 +254,15 @@ private: // Functions
                           const std::vector<DeviceModelVariable>& component_variables);
 
     ///
+    /// \brief Write the spelling of the name and instance of a component to its database row.
+    /// \param component_key        The component as the component config spells it.
+    /// \param db_component_key     The component as the database holds it, including its database id.
+    ///
+    /// \throws InitDeviceModelDbError When the component could not be updated
+    ///
+    void update_component_spelling(const ComponentKey& component_key, const ComponentKey& db_component_key);
+
+    ///
     /// \brief Insert variable characteristics
     /// \param characteristics  The characteristics.
     /// \param variable_id      The variable id in the database.
@@ -271,7 +304,8 @@ private: // Functions
                          const std::uint64_t component_id);
 
     ///
-    /// \brief Delete a variable from the database.
+    /// \brief Delete a variable from the database. Its monitors are kept by name key, so they apply when an owner
+    /// registers the variable at runtime; its values are removed with it.
     /// \param variable The variable to delete.
     ///
     /// \throws InitDeviceModelDbError If variable could not be deleted
@@ -389,20 +423,23 @@ private: // Functions
     std::map<ComponentKey, std::vector<DeviceModelVariable>> get_all_components_from_db();
 
     ///
-    /// \brief Warn about components that exist in the database but are not declared in the
-    ///        component config (no JSON file present on this install). The orphan rows are
-    ///        intentionally kept so per-slot components such as NetworkConfiguration_<N>
-    ///        survive missing JSON files and the legacy NetworkConnectionProfiles blob can
-    ///        still migrate into them on a later boot.
+    /// \brief Removes the components that exist in the database but not in the component config, with their
+    ///        variables, so that the database mirrors the config files. A NetworkConfiguration component is kept:
+    ///        the migration of the legacy NetworkConnectionProfiles blob creates the slots it needs from the
+    ///        embedded default schema, without a config file. If the component config lacks a component with a
+    ///        required variable that the database contains, the component config is taken as incomplete, for example
+    ///        a wrong or partly deployed config directory, and no component is removed, so that the stored values
+    ///        survive until the config is fixed.
     /// \param component_config  The component config.
     /// \param db_components     The components in the database.
     ///
-    void warn_about_components_missing_from_config(
+    void remove_components_missing_from_config(
         const std::map<ComponentKey, std::vector<DeviceModelVariable>>& component_config,
         const std::map<ComponentKey, std::vector<DeviceModelVariable>>& db_components);
 
     ///
-    /// \brief Remove a component from the database.
+    /// \brief Remove a component from the database, with its variables. Monitors are keyed by name and stay, like
+    ///        when a variable is removed: they apply again when an owner registers the variable at runtime.
     /// \param component    The component to remove.
     /// \return True on success.
     ///
@@ -416,9 +453,9 @@ private: // Functions
     /// \param db_component_variables         The component that currently exists in the database and needs updating.
     /// \param component_variables            The component_variables of the component.
     ///
-    void
-    update_component_variables(const std::pair<ComponentKey, std::vector<DeviceModelVariable>>& db_component_variables,
-                               const std::vector<DeviceModelVariable>& variables);
+    void update_component_variables(
+        const std::pair<const ComponentKey, std::vector<DeviceModelVariable>>& db_component_variables,
+        const std::vector<DeviceModelVariable>& variables);
 
     ///
     /// \brief Get variable attributes belonging to a specific variable from the database.

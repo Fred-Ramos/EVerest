@@ -7,7 +7,9 @@ Migrate to the Combined OCPP Module
 This is a goal-oriented how-to guide on migrating an existing deployment from
 the separate ``OCPP`` (1.6) or ``OCPP201`` module to the combined OCPP module
 :ref:`OCPPmulti <everest_modules_OCPPmulti>`, which supports OCPP 1.6, 2.0.1,
-and 2.1 from a single module instance.
+and 2.1 from a single module instance. The ``OCPP`` and ``OCPP201`` modules,
+deprecated in 2026.10.0, are no longer part of EVerest, so an installation that
+still uses one of them switches to OCPPmulti when it upgrades.
 
 The migration has up to three parts:
 
@@ -29,7 +31,7 @@ Coming from OCPP201
 
 These ``OCPP201`` config keys exist unchanged in OCPPmulti:
 ``MessageLogPath``, ``CoreDatabasePath``, ``DeviceModelDatabasePath``,
-``EverestDeviceModelDatabasePath``, ``DeviceModelDatabaseMigrationPath``,
+``DeviceModelDatabaseMigrationPath``,
 ``DeviceModelConfigPath``, ``EnableExternalWebsocketControl``,
 ``MessageQueueResumeDelay``, ``CompositeScheduleIntervalS``,
 ``RequestCompositeScheduleDurationS``, ``RequestCompositeScheduleUnit``,
@@ -51,6 +53,35 @@ controlled by the device model variable ``SupportedOcppVersions`` of the
 ``InternalCtrlr`` component (a comma-separated preference list, e.g.
 ``ocpp2.1,ocpp2.0.1``). Apart from the custom error mapping, everything else
 in an existing ``OCPP201`` configuration carries over without changes.
+
+``EverestDeviceModelDatabasePath`` is deprecated. OCPPmulti keeps the whole
+device model in the database at ``DeviceModelDatabasePath``. At the first
+start, it takes over the database at ``EverestDeviceModelDatabasePath``: the
+``Enabled`` values of the DER controllers that the CSMS set are imported, and
+the file is renamed to ``*.migrated``. Its other values are not carried over.
+OCPP 1.6 has no DER controllers, so in OCPP 1.6 mode the imported values are
+kept in the database unused, and they apply at a later start in OCPP 2.x mode.
+If the database at ``EverestDeviceModelDatabasePath`` cannot be read, or the
+device model database cannot store a value, it keeps its name and the import
+is repeated at the next start. The components EVerest provides (``EVSE``, ``Connector``, ``ConnectedEV`` and
+others) are registered at every start, and module configuration values are
+read from the configuration service. Monitors the CSMS set are kept, since the
+old module stored them in the database at ``DeviceModelDatabasePath``. Once
+the module has started, the ``*.migrated`` file can be deleted and the key
+removed from the configuration.
+
+A component configuration at ``DeviceModelConfigPath`` must not define the
+variables EVerest registers, such as ``EVSE`` / ``Power`` or ``Connector`` /
+``Available``. Such a variable is a conflict: it keeps its component
+configuration definition, and the module logs every conflict as an error at
+each start, naming what to remove. Set ``FailOnDeviceModelConflicts`` to stop
+the module instead. Variables of these components that EVerest does not
+register may stay in the component configuration. Removing a variable from a
+file, or the whole file, takes it out of the database at the next start; the
+monitors the CSMS set on it are kept and apply to the variable EVerest
+registers. A component configuration of an EVSE or connector that does not
+exist stops the start, since the number of EVSEs and connectors in the device
+model no longer matches the station.
 
 Coming from OCPP (1.6)
 ----------------------
@@ -226,6 +257,100 @@ configuration at runtime.
 The referenced component and variable must already exist in the component
 configuration at ``DeviceModelConfigPath``. The mapping file tells the
 migration where to write the value — it does not create the target variable.
+
+A variable that is added to the device model at runtime, for example an EVerest
+module configuration value or a component that EVerest provides, is not a
+mapping target: an entry that names one is ignored with an error log. An OCPP
+2.x CSMS and the ``ocpp`` interface still reach such a variable by its
+component and variable.
+
+An entry stores its key in the ``Actual`` attribute of the variable, and each
+attribute stores exactly one OCPP 1.6 key. Built-in keys can share a variable
+through different attributes: ``MeterValuesAlignedData`` is stored in the
+``Actual`` attribute of ``AlignedDataCtrlr`` ``Measurands``, and
+``MeterValuesAlignedDataMaxLength`` in its ``maxLimit``. Entries that break
+this rule are ignored with an error log, and the remaining entries still
+apply. Entries are read in file order, so of two entries for the same key or
+the same component and variable the first one is used. An entry is also
+ignored when it targets a variable whose ``Actual`` attribute stores a
+built-in key, for example ``OCPPCommCtrlr`` ``HeartbeatInterval``, the
+connection configuration, or a variable whose value the OCPP 1.6 stack
+computes: the ``SupportedFeatureProfiles`` variable and the variables that hold
+the limit of a max-length key, for example ``LocalAuthListCtrlr`` ``Entries``.
+
+Check the log after changing the mapping file. An ignored entry for a built-in
+key leaves the key on its built-in mapping, and the migration writes its value
+to the ``OCPP16LegacyCtrlr`` variable. The value of an ignored custom key is not
+migrated.
+
+A custom key whose variable is not defined in the component configuration or has
+no ``Actual`` attribute is reported with an error log at every start and is not
+available to OCPP 1.6.
+
+A file that cannot be read or does not match the mapping file schema stops the
+module at startup.
+
+A built-in mapping stays reserved for its key even when the file replaces it:
+the freed ``OCPP16LegacyCtrlr`` variable cannot be used by another entry, and
+two keys cannot swap variables. An entry may map a built-in key to its own
+``OCPP16LegacyCtrlr`` variable, which has no effect.
+
+.. _howto-ocpp-storage-migration-share-legacy-key:
+
+Share an OCPP 1.6 key with your own OCPP 2.x variable
+-----------------------------------------------------
+
+Built-in OCPP 1.6 keys without a standard OCPP 2.x equivalent, such as
+``LightIntensity`` or ``Language``, are stored in the ``OCPP16LegacyCtrlr``
+component. If your component configuration already has an OCPP 2.x variable for
+the same setting, add an entry for the built-in key to the mapping file. The
+key is then stored in your variable instead, so OCPP 1.6 and OCPP 2.x read and
+write the same value:
+
+.. code-block:: yaml
+
+   mappings:
+     - ocpp16_key: LightIntensity
+       component:
+         name: VendorStation
+       variable:
+         name: LightIntensity
+
+The entry replaces the built-in mapping everywhere: during the one-time
+migration, for ``GetConfiguration`` and ``ChangeConfiguration``, and for the
+canonical address of the key. The module removes the ``OCPP16LegacyCtrlr``
+variable of the key from the device model at every startup, so an OCPP 2.x CSMS
+does not see it in reports and cannot get or set it. Your variable keeps the
+mutability of your component configuration, also for keys that are read-only in
+OCPP 1.6. The module logs every replaced mapping at startup.
+
+The module ignores the entry with an error log, and the key keeps its built-in
+mapping and its ``OCPP16LegacyCtrlr`` variable, when the entry:
+
+* replaces the mapping of a built-in key that is not stored in
+  ``OCPP16LegacyCtrlr``. Keys with a standard OCPP 2.x or ``InternalCtrlr``
+  variable already share it between protocol versions.
+* replaces the mapping of ``NumberOfConnectors``, ``SupportedFeatureProfiles``,
+  ``MeterPublicKeys`` or ``DefaultPriceText``, which the OCPP 1.6 stack derives
+  or expands itself.
+* maps a built-in key to a variable that does not exist in the component
+  configuration. The migration then writes the value to the
+  ``OCPP16LegacyCtrlr`` variable of the key.
+* maps a built-in key to a variable whose ``dataType`` differs from the key's
+  ``OCPP16LegacyCtrlr`` variable, for example a ``boolean`` variable for the
+  ``integer`` key ``LightIntensity``. The migration then writes the value to
+  the ``OCPP16LegacyCtrlr`` variable of the key.
+* maps a built-in key to a variable without an ``Actual`` attribute, which
+  stores the key's value. The migration then writes the value to the
+  ``OCPP16LegacyCtrlr`` variable of the key.
+
+The value is not carried over when a mapping is replaced after the database was
+migrated: the key then reads the current value of the new variable, and the
+``OCPP16LegacyCtrlr`` variable is removed together with its value. To keep the
+value, read it before you add the entry and set it on the new variable, or
+delete the database to repeat the migration. When you remove the entry again,
+the ``OCPP16LegacyCtrlr`` variable comes back with the value of the component
+configuration, and the value set through the key stays in your variable.
 
 Run the migration
 -----------------

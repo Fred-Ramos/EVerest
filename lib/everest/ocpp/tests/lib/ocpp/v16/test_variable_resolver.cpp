@@ -46,10 +46,10 @@ ocpp::v2::Ocpp16KeyMappings custom_mappings_fixture() {
     ocpp::v2::Ocpp16KeyMappings mappings;
     // unambiguous custom mapping
     mappings.emplace("VendorBar", std::make_pair(make_component("VendorCtrlr"), make_variable("BarSetting")));
-    // two custom keys mapping to the same CV -> ambiguous reverse
+    // two custom keys mapping to the same CV -> the first in key order is kept
     mappings.emplace("VendorFoo", std::make_pair(make_component("VendorCtrlr"), make_variable("FooSetting")));
     mappings.emplace("VendorFooAlias", std::make_pair(make_component("VendorCtrlr"), make_variable("FooSetting")));
-    // custom mapping colliding with the standard reverse entry for HeartbeatInterval
+    // custom mapping onto the built-in target of HeartbeatInterval -> ignored
     mappings.emplace("MyHeartbeat",
                      std::make_pair(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval")));
     // custom mapping shadowing a derived key must not be reachable via key_to_cv
@@ -78,9 +78,8 @@ TEST(VariableResolver, RoundTripStandardKeys) {
             return; // derived / unmapped / max-limit keys
         }
         const auto reverse = resolver.cv_to_key(cv->first, cv->second);
-        ASSERT_TRUE(reverse.key.has_value()) << "no reverse mapping for " << name;
-        EXPECT_EQ(reverse.key.value(), name);
-        EXPECT_FALSE(reverse.ambiguous) << "unexpected ambiguity for " << name;
+        ASSERT_TRUE(reverse.has_value()) << "no reverse mapping for " << name;
+        EXPECT_EQ(reverse.value(), name);
         ++checked;
     });
     EXPECT_GT(checked, 0);
@@ -142,19 +141,19 @@ TEST(VariableResolver, CustomMappingForward) {
 TEST(VariableResolver, CustomMappingReverse) {
     const VariableResolver resolver{custom_mappings_fixture()};
     const auto reverse = resolver.cv_to_key(make_component("VendorCtrlr"), make_variable("BarSetting"));
-    ASSERT_TRUE(reverse.key.has_value());
-    EXPECT_EQ(reverse.key.value(), "VendorBar");
-    EXPECT_FALSE(reverse.ambiguous);
+    ASSERT_TRUE(reverse.has_value());
+    EXPECT_EQ(reverse.value(), "VendorBar");
 }
 
-TEST(VariableResolver, CustomMappingReverseAmbiguousTwoKeysOneCv) {
+TEST(VariableResolver, CustomKeysSharingCvKeepFirstKey) {
     const VariableResolver resolver{custom_mappings_fixture()};
-    const auto reverse = resolver.cv_to_key(make_component("VendorCtrlr"), make_variable("FooSetting"));
-    EXPECT_TRUE(reverse.ambiguous);
+    EXPECT_EQ(resolver.cv_to_key(make_component("VendorCtrlr"), make_variable("FooSetting")), "VendorFoo");
+    EXPECT_TRUE(resolver.key_to_cv("VendorFoo").has_value());
+    EXPECT_FALSE(resolver.key_to_cv("VendorFooAlias").has_value());
 }
 
 TEST(VariableResolver, CustomMappingsDifferingByEvseAreDistinct) {
-    // mappings that differ only in Component::evse must not collide into an ambiguous reverse entry
+    // mappings that differ only in Component::evse must not collide
     const auto evse_component = [](std::int32_t id) {
         ocpp::v2::Component component = make_component("VendorCtrlr");
         ocpp::v2::EVSE evse;
@@ -168,23 +167,39 @@ TEST(VariableResolver, CustomMappingsDifferingByEvseAreDistinct) {
     const VariableResolver resolver{mappings};
 
     const auto reverse1 = resolver.cv_to_key(evse_component(1), make_variable("PerEvseSetting"));
-    ASSERT_TRUE(reverse1.key.has_value());
-    EXPECT_EQ(reverse1.key.value(), "VendorEvse1");
-    EXPECT_FALSE(reverse1.ambiguous);
+    ASSERT_TRUE(reverse1.has_value());
+    EXPECT_EQ(reverse1.value(), "VendorEvse1");
 
     const auto reverse2 = resolver.cv_to_key(evse_component(2), make_variable("PerEvseSetting"));
-    ASSERT_TRUE(reverse2.key.has_value());
-    EXPECT_EQ(reverse2.key.value(), "VendorEvse2");
-    EXPECT_FALSE(reverse2.ambiguous);
+    ASSERT_TRUE(reverse2.has_value());
+    EXPECT_EQ(reverse2.value(), "VendorEvse2");
 }
 
-TEST(VariableResolver, CustomMappingReverseAmbiguousCollidesWithStandard) {
+TEST(VariableResolver, EvseVariantOfBuiltinTargetHasNoKey) {
+    // the built-in reverse table compares the full component, so an EVSE-scoped variable with the name of a
+    // built-in target is a different variable
+    ocpp::v2::Component evse_comm_ctrlr = make_component("OCPPCommCtrlr");
+    ocpp::v2::EVSE evse;
+    evse.id = 1;
+    evse_comm_ctrlr.evse = evse;
+    const VariableResolver resolver{{}};
+
+    const auto reverse = resolver.cv_to_key(evse_comm_ctrlr, make_variable("HeartbeatInterval"));
+    EXPECT_FALSE(reverse.has_value());
+    EXPECT_EQ(resolver.classify(evse_comm_ctrlr, make_variable("HeartbeatInterval")), CVClass::Free);
+
+    const auto builtin = resolver.cv_to_key(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval"));
+    ASSERT_TRUE(builtin.has_value());
+    EXPECT_EQ(builtin.value(), "HeartbeatInterval");
+    EXPECT_EQ(resolver.classify(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval")),
+              CVClass::KeyBacked);
+}
+
+TEST(VariableResolver, CustomKeyOnBuiltinTargetIsIgnored) {
     const VariableResolver resolver{custom_mappings_fixture()};
-    const auto reverse = resolver.cv_to_key(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval"));
-    EXPECT_TRUE(reverse.ambiguous);
-    // the standard key remains reported
-    ASSERT_TRUE(reverse.key.has_value());
-    EXPECT_EQ(reverse.key.value(), "HeartbeatInterval");
+    EXPECT_EQ(resolver.cv_to_key(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval")),
+              "HeartbeatInterval");
+    EXPECT_FALSE(resolver.key_to_cv("MyHeartbeat").has_value());
 }
 
 TEST(VariableResolver, IsConnectionConfigCvPredicate) {
@@ -196,6 +211,17 @@ TEST(VariableResolver, IsConnectionConfigCvPredicate) {
     EXPECT_FALSE(is_connection_config_cv(make_component("SecurityCtrlr"), make_variable("CertificateEntries")));
     EXPECT_FALSE(is_connection_config_cv(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval")));
     EXPECT_FALSE(is_connection_config_cv(make_component("VendorCtrlr"), make_variable("BarSetting")));
+}
+
+TEST(VariableResolver, IsReadOnlyDerivedCvPredicate) {
+    // the public predicate backs both classify() and the custom-mapping load-time rejection
+    using ocpp::v16::is_read_only_derived_cv;
+    const auto& sfp = ocpp::v2::ControllerComponentVariables::SupportedFeatureProfiles;
+    ASSERT_TRUE(sfp.variable.has_value());
+    EXPECT_TRUE(is_read_only_derived_cv(sfp.component, sfp.variable.value()));
+    EXPECT_TRUE(is_read_only_derived_cv(make_component("LocalAuthListCtrlr"), make_variable("Entries")));
+    EXPECT_FALSE(is_read_only_derived_cv(make_component("OCPPCommCtrlr"), make_variable("HeartbeatInterval")));
+    EXPECT_FALSE(is_read_only_derived_cv(make_component("VendorCtrlr"), make_variable("BarSetting")));
 }
 
 TEST(VariableResolver, ClassifyConnectionConfig) {
@@ -236,8 +262,101 @@ TEST(VariableResolver, ClassifyKeyBacked) {
 TEST(VariableResolver, ClassifyFree) {
     const VariableResolver resolver{custom_mappings_fixture()};
     EXPECT_EQ(resolver.classify(make_component("VendorCtrlr"), make_variable("Foo")), CVClass::Free);
-    // ambiguous custom CV is not key-backed
-    EXPECT_EQ(resolver.classify(make_component("VendorCtrlr"), make_variable("FooSetting")), CVClass::Free);
+}
+
+TEST(VariableResolver, LegacyKeyOverride) {
+    ocpp::v2::Ocpp16KeyMappings mappings;
+    mappings.emplace("LightIntensity",
+                     std::make_pair(make_component("VendorStation"), make_variable("LightIntensity")));
+    const VariableResolver resolver{mappings};
+
+    const auto cv = resolver.key_to_cv("LightIntensity");
+    ASSERT_TRUE(cv.has_value());
+    EXPECT_TRUE(same_cv(cv.value(), {make_component("VendorStation"), make_variable("LightIntensity")}));
+
+    const auto reverse = resolver.cv_to_key(make_component("VendorStation"), make_variable("LightIntensity"));
+    EXPECT_EQ(reverse, "LightIntensity");
+    EXPECT_EQ(resolver.classify(make_component("VendorStation"), make_variable("LightIntensity")), CVClass::KeyBacked);
+
+    // the built-in OCPP16LegacyCtrlr variable is no longer backed by the key
+    EXPECT_FALSE(resolver.cv_to_key(make_component("OCPP16LegacyCtrlr"), make_variable("LightIntensity")));
+    EXPECT_EQ(resolver.classify(make_component("OCPP16LegacyCtrlr"), make_variable("LightIntensity")), CVClass::Free);
+}
+
+ocpp::v2::Ocpp16KeyMappings light_intensity_override() {
+    return {{"LightIntensity", {make_component("VendorStation"), make_variable("LightIntensity")}}};
+}
+
+TEST(VariableResolver, OnlyOcpp16LegacyCtrlrKeysAreOverridable) {
+    using ocpp::v16::is_overridable_key;
+    EXPECT_TRUE(is_overridable_key(keys::valid_keys::LightIntensity));
+    EXPECT_TRUE(is_overridable_key(keys::valid_keys::Language));
+    EXPECT_TRUE(is_overridable_key(keys::valid_keys::BlinkRepeat));
+
+    // standard and InternalCtrlr mappings
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::HeartbeatInterval));
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::ChargePointModel));
+    // no device model mapping
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::CentralSystemURI));
+    // derived or expanded by the OCPP 1.6 stack
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::NumberOfConnectors));
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::SupportedFeatureProfiles));
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::MeterPublicKeys));
+    EXPECT_FALSE(is_overridable_key(keys::valid_keys::DefaultPriceText));
+}
+
+TEST(VariableResolver, KnownKeyWithoutOverrideMatchesBuiltin) {
+    const VariableResolver resolver;
+    const auto cv = resolver.known_key_to_cv(keys::valid_keys::LightIntensity);
+    ASSERT_TRUE(cv.has_value());
+    EXPECT_TRUE(same_cv(cv.value(), {make_component("OCPP16LegacyCtrlr"), make_variable("LightIntensity")}));
+    EXPECT_EQ(resolver.cv_to_known_key(cv->first, cv->second), "LightIntensity");
+}
+
+TEST(VariableResolver, KnownKeyOverrideReplacesForwardAndReverseMapping) {
+    const VariableResolver resolver{light_intensity_override()};
+    EXPECT_TRUE(resolver.is_overridden(keys::valid_keys::LightIntensity));
+    EXPECT_TRUE(resolver.custom_keys().empty());
+
+    const auto cv = resolver.known_key_to_cv(keys::valid_keys::LightIntensity);
+    ASSERT_TRUE(cv.has_value());
+    EXPECT_TRUE(same_cv(cv.value(), {make_component("VendorStation"), make_variable("LightIntensity")}));
+
+    EXPECT_EQ(resolver.cv_to_known_key(make_component("VendorStation"), make_variable("LightIntensity")),
+              "LightIntensity");
+    EXPECT_FALSE(resolver
+                     .cv_to_known_key(make_component("VendorStation"), make_variable("LightIntensity"),
+                                      ocpp::v2::AttributeEnum::Target)
+                     .has_value());
+    EXPECT_FALSE(
+        resolver.cv_to_known_key(make_component("OCPP16LegacyCtrlr"), make_variable("LightIntensity")).has_value());
+}
+
+TEST(VariableResolver, OtherKnownKeysKeepBuiltinMapping) {
+    const VariableResolver resolver{light_intensity_override()};
+    EXPECT_FALSE(resolver.is_overridden(keys::valid_keys::BlinkRepeat));
+    const auto cv = resolver.known_key_to_cv(keys::valid_keys::BlinkRepeat);
+    ASSERT_TRUE(cv.has_value());
+    EXPECT_EQ(cv->first.name.get(), "OCPP16LegacyCtrlr");
+}
+
+TEST(VariableResolver, NotOverridableKnownKeysAreIgnored) {
+    const VariableResolver resolver{
+        {{"HeartbeatInterval", {make_component("VendorStation"), make_variable("Heartbeat")}},
+         {"NumberOfConnectors", {make_component("VendorStation"), make_variable("Connectors")}}}};
+    EXPECT_TRUE(resolver.overrides().empty());
+    EXPECT_TRUE(resolver.custom_keys().empty());
+    const auto cv = resolver.known_key_to_cv(keys::valid_keys::HeartbeatInterval);
+    ASSERT_TRUE(cv.has_value());
+    EXPECT_EQ(cv->first.name.get(), "OCPPCommCtrlr");
+}
+
+TEST(VariableResolver, CustomKeysExcludeKnownKeys) {
+    auto mappings = light_intensity_override();
+    mappings.emplace("VendorKey", std::make_pair(make_component("VendorStation"), make_variable("VendorVariable")));
+    const VariableResolver resolver{mappings};
+    EXPECT_EQ(resolver.custom_keys().size(), 1);
+    EXPECT_NE(resolver.custom_keys().find("VendorKey"), resolver.custom_keys().end());
 }
 
 } // namespace

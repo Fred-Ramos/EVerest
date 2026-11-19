@@ -40,6 +40,7 @@ target_sources(${TEST_TARGET_NAME}
     # general
     charge_point_config_factory_v16_tests.cpp
     custom_error_mapping_overlay_tests.cpp
+    everest_device_model_tests.cpp
     generic_ocpp_error_dispatch_tests.cpp
     generic_ocpp_tests.cpp
     generic_ocpp_v16_connector_tests.cpp
@@ -71,6 +72,14 @@ target_sources(${TEST_TARGET_NAME}
 target_compile_definitions(${TEST_TARGET_NAME}
     PRIVATE
     UNIT_TESTS
+)
+
+# generic_ocpp.hpp pulls in the framework, the generated interfaces and libocpp, about 10 s per source
+target_precompile_headers(${TEST_TARGET_NAME}
+    PRIVATE
+    <gmock/gmock.h>
+    <gtest/gtest.h>
+    "${CMAKE_CURRENT_SOURCE_DIR}/../generic_ocpp.hpp"
 )
 
 # Relative to the WORKING_DIRECTORY, so the compile flags don't differ between build trees.
@@ -108,6 +117,8 @@ set(TEST_FILES_SQL
     2_up-variable_source.sql
     3_down-variable_required.sql
     3_up-variable_required.sql
+    4_down-device_model_ownership.sql
+    4_up-device_model_ownership.sql
 )
 set(TEST_FILES_JSON
     default_store.json

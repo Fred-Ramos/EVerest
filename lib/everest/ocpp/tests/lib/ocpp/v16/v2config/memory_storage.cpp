@@ -172,10 +172,6 @@ const std::vector<MemoryStorage::Storage*> vars_list = {
 const ocpp::v2::VariableCharacteristics characteristics = {ocpp::v2::DataEnum::string, false, {}, {}, {}, {}, {}, {}};
 const ocpp::v2::VariableMetaData meta_data = {characteristics, {}, {}};
 
-bool operator==(const ocpp::v2::Component& lhs, const ocpp::v2::Component& rhs) {
-    return lhs.name == rhs.name;
-}
-
 bool operator==(const std::optional<ocpp::v2::Variable>& lhs, const ocpp::v2::Variable& rhs) {
     if (lhs) {
         return lhs.value().name == rhs.name;
@@ -185,7 +181,7 @@ bool operator==(const std::optional<ocpp::v2::Variable>& lhs, const ocpp::v2::Va
 
 bool is_same(const ocpp::v2::RequiredComponentVariable& var, const ocpp::v2::Component& component,
              const ocpp::v2::Variable& variable) {
-    return ((var.component == component) && (var.variable == variable));
+    return ((var.component.name == component.name) && (var.variable == variable));
 }
 
 std::string enhanced_convert(const ocpp::v2::Component& component, const ocpp::v2::Variable& variable,
@@ -607,13 +603,13 @@ MemoryStorage::SetVariableStatusEnum MemoryStorage::set_value(const Component& c
                                                               const Variable& variable_id,
                                                               const AttributeEnum& attribute_enum,
                                                               const std::string& value, const std::string& source,
-                                                              bool allow_read_only) {
+                                                              bool allow_read_only_update) {
     const auto key_str = enhanced_convert(component_id, variable_id, attribute_enum);
     MemoryStorage::SetVariableStatusEnum result;
     if (!key_str.empty()) {
         // mirror DeviceModel::set_value(): Reject writes when the configured
         // mutability is ReadOnly
-        if (!allow_read_only && get_configured_mutability(key_str) == MutabilityEnum::ReadOnly) {
+        if (!allow_read_only_update && get_configured_mutability(key_str) == MutabilityEnum::ReadOnly) {
             return MemoryStorage::SetVariableStatusEnum::Rejected;
         }
         const auto key_opt = v16::keys::convert(key_str);
@@ -644,7 +640,7 @@ MemoryStorage::SetVariableStatusEnum MemoryStorage::clear_value(const Component&
                                                                 const AttributeEnum& attribute_enum,
                                                                 const std::string& source) {
     // Stub: clearing is equivalent to setting "" without validate_value gating; the in-memory
-    // storage doesn't enforce minLimit, so a plain set_value with allow_read_only=true matches.
+    // storage doesn't enforce minLimit, so a plain set_value with allow_read_only_update=true matches.
     return set_value(component_id, variable_id, attribute_enum, "", source, true);
 }
 

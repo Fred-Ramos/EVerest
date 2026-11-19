@@ -14,6 +14,13 @@
 
 namespace ocpp_module_common {
 namespace conversions {
+std::optional<bool> get_disable_connectors_during_install(const types::system::FirmwareUpdateStatus& status) {
+    if (!status.firmware_update_metadata.has_value()) {
+        return std::nullopt;
+    }
+    return status.firmware_update_metadata->disable_connectors_during_install;
+}
+
 ocpp::v2::FirmwareStatusEnum to_ocpp_firmware_status_enum(const types::system::FirmwareUpdateStatusEnum status) {
     switch (status) {
     case types::system::FirmwareUpdateStatusEnum::Downloaded:
@@ -170,8 +177,8 @@ to_ocpp_meter_value(const types::powermeter::Powermeter& power_meter,
         if (energy_Wh_import_signed.total.has_value()) {
             sampled_value.signedMeterValue = to_ocpp_signed_meter_value(energy_Wh_import_signed.total.value());
             energy_Wh_import_signed_total_added = true;
+            meter_value.sampledValue.push_back(sampled_value);
         }
-        meter_value.sampledValue.push_back(sampled_value);
     }
 
     if (not energy_Wh_import_signed_total_added) {
@@ -488,6 +495,37 @@ to_ocpp_meter_value(const types::powermeter::Powermeter& power_meter,
                 if (voltage_V_signed.DC.has_value()) {
                     sampled_value.signedMeterValue = to_ocpp_signed_meter_value(voltage_V_signed.DC.value());
                 }
+            }
+            meter_value.sampledValue.push_back(sampled_value);
+        }
+    }
+
+    // Frequency
+    if (power_meter.frequency_Hz.has_value()) {
+        const auto& frequency_Hz = power_meter.frequency_Hz.value();
+        const auto& frequency_Hz_signed = power_meter.frequency_Hz_signed;
+        sampled_value =
+            to_ocpp_sampled_value(reading_context, ocpp::v2::MeasurandEnum::Frequency, "Hz", ocpp::v2::PhaseEnum::L1);
+        sampled_value.value = frequency_Hz.L1;
+        if (frequency_Hz_signed.has_value() and frequency_Hz_signed.value().L1.has_value()) {
+            sampled_value.signedMeterValue = to_ocpp_signed_meter_value(frequency_Hz_signed.value().L1.value());
+        }
+        meter_value.sampledValue.push_back(sampled_value);
+        if (frequency_Hz.L2.has_value()) {
+            sampled_value = to_ocpp_sampled_value(reading_context, ocpp::v2::MeasurandEnum::Frequency, "Hz",
+                                                  ocpp::v2::PhaseEnum::L2);
+            sampled_value.value = frequency_Hz.L2.value();
+            if (frequency_Hz_signed.has_value() and frequency_Hz_signed.value().L2.has_value()) {
+                sampled_value.signedMeterValue = to_ocpp_signed_meter_value(frequency_Hz_signed.value().L2.value());
+            }
+            meter_value.sampledValue.push_back(sampled_value);
+        }
+        if (frequency_Hz.L3.has_value()) {
+            sampled_value = to_ocpp_sampled_value(reading_context, ocpp::v2::MeasurandEnum::Frequency, "Hz",
+                                                  ocpp::v2::PhaseEnum::L3);
+            sampled_value.value = frequency_Hz.L3.value();
+            if (frequency_Hz_signed.has_value() and frequency_Hz_signed.value().L3.has_value()) {
+                sampled_value.signedMeterValue = to_ocpp_signed_meter_value(frequency_Hz_signed.value().L3.value());
             }
             meter_value.sampledValue.push_back(sampled_value);
         }

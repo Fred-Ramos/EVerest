@@ -85,6 +85,14 @@ async def wait_for_mock_called(mock, call=None, timeout=10):
     await asyncio.wait_for(_await_called(), timeout=timeout)
 
 
+async def wait_for_mock_call_count(mock, count, timeout=10):
+    async def _await_calls():
+        while mock.call_count < count:
+            await asyncio.sleep(0.1)
+
+    await asyncio.wait_for(_await_calls(), timeout=timeout)
+
+
 async def wait_for_mock_call_matching(mock, predicate, timeout=10):
     """Waits for a call whose single argument satisfies predicate and returns that argument."""
 
@@ -106,6 +114,40 @@ async def wait_for_mock_call_matching(mock, predicate, timeout=10):
     return _matching_argument()
 
 
+def availability_calls(mock):
+    return [
+        entry.args[0]
+        for entry in mock.mock_calls
+        if entry.args and entry.args[0]["cmd_source"]["enable_source"] == "CSMS"
+    ]
+
+
+async def wait_for_firmware_availability_state(mock, state, count=1, timeout=10):
+    async def _await_calls():
+        while len(
+            [
+                call
+                for call in availability_calls(mock)
+                if call["cmd_source"]["enable_state"] == state
+            ]
+        ) < count:
+            await asyncio.sleep(0.1)
+
+    await asyncio.wait_for(_await_calls(), timeout=timeout)
+
+
+def publish_firmware_status(probe_module, status, request_id, disable_connectors=None):
+    update = {
+        "firmware_update_status": status,
+        "request_id": request_id,
+    }
+    if disable_connectors is not None:
+        update["firmware_update_metadata"] = {
+            "disable_connectors_during_install": disable_connectors
+        }
+    probe_module.publish_variable("system", "firmware_update_status", update)
+
+
 async def wait_for_connection_state(csms_connection, connected, timeout=15):
     async def _await_state():
         while csms_connection.is_connected != connected:
@@ -120,6 +162,211 @@ async def wait_for_connection_state(csms_connection, connected, timeout=15):
 @pytest.mark.probe_module(connections={"ocpp": [Requirement("ocpp", "ocpp_generic")]})
 @pytest.mark.asyncio
 class TestOCPP16GenericInterfaceIntegration:
+
+    async def test_firmware_install_scheduled_notifies_once_per_cycle(
+        self, _env
+    ):
+        availability_mocks = [
+            _env.probe_module_command_mocks[implementation]["enable_disable"]
+            for implementation in ("evse_manager", "evse_manager_b")
+        ]
+        installation_mock = _env.probe_module_command_mocks["system"][
+            "allow_firmware_installation"
+        ]
+        for mock in availability_mocks:
+            mock.reset_mock()
+        installation_mock.reset_mock()
+
+        publish_firmware_status(
+            _env.probe_module,
+            "InstallScheduled",
+            request_id=41,
+            disable_connectors=True,
+        )
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Disable")
+        await wait_for_mock_call_count(installation_mock, 1)
+
+        publish_firmware_status(
+            _env.probe_module,
+            "InstallScheduled",
+            request_id=41,
+            disable_connectors=True,
+        )
+        publish_firmware_status(_env.probe_module, "Installed", request_id=41)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Enable")
+        assert installation_mock.call_count == 1
+        for mock in availability_mocks:
+            states = [
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ]
+            assert set(states[: states.index("Enable")]) == {"Disable"}
+            mock.reset_mock()
+
+        publish_firmware_status(
+            _env.probe_module,
+            "InstallScheduled",
+            request_id=42,
+            disable_connectors=True,
+        )
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Disable")
+            assert set(
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ) == {"Disable"}
+        await wait_for_mock_call_count(installation_mock, 2)
+
+        publish_firmware_status(_env.probe_module, "Idle", request_id=42)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Enable")
+            mock.reset_mock()
+
+        publish_firmware_status(
+            _env.probe_module,
+            "InstallScheduled",
+            request_id=42,
+            disable_connectors=True,
+        )
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Disable")
+        await wait_for_mock_call_count(installation_mock, 3)
+
+        publish_firmware_status(_env.probe_module, "Installed", request_id=42)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Enable")
+        assert installation_mock.call_count == 3
+
+    async def test_firmware_install_scheduled_explicit_false_keeps_connectors_available(
+        self, _env
+    ):
+        availability_mocks = [
+            _env.probe_module_command_mocks[implementation]["enable_disable"]
+            for implementation in ("evse_manager", "evse_manager_b")
+        ]
+        for mock in availability_mocks:
+            mock.reset_mock()
+        status_mock = (
+            _env.csms_mock.on_signed_update_firmware_status_notificaion
+        )
+        status_mock.reset_mock()
+
+        publish_firmware_status(
+            _env.probe_module,
+            "InstallScheduled",
+            request_id=51,
+            disable_connectors=False,
+        )
+        publish_firmware_status(
+            _env.probe_module,
+            "Installing",
+            request_id=51,
+            disable_connectors=False,
+        )
+        await wait_for_mock_call_count(status_mock, 2)
+
+        for mock in availability_mocks:
+            assert availability_calls(mock) == []
+
+    async def test_firmware_metadata_default_uses_unsigned_downloaded_phase(self, _env):
+        availability_mocks = [
+            _env.probe_module_command_mocks[implementation]["enable_disable"]
+            for implementation in ("evse_manager", "evse_manager_b")
+        ]
+        for mock in availability_mocks:
+            mock.reset_mock()
+
+        publish_firmware_status(_env.probe_module, "InstallScheduled", request_id=-1)
+        publish_firmware_status(_env.probe_module, "Downloaded", request_id=-1)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Disable")
+            assert [
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ] == ["Disable"]
+
+        publish_firmware_status(_env.probe_module, "DownloadFailed", request_id=-1)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Enable")
+            assert [
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ] == ["Disable", "Enable"]
+
+    async def test_firmware_metadata_default_uses_signed_verified_phase(self, _env):
+        availability_mocks = [
+            _env.probe_module_command_mocks[implementation]["enable_disable"]
+            for implementation in ("evse_manager", "evse_manager_b")
+        ]
+        for mock in availability_mocks:
+            mock.reset_mock()
+
+        publish_firmware_status(_env.probe_module, "Downloaded", request_id=61)
+        publish_firmware_status(_env.probe_module, "SignatureVerified", request_id=61)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Disable")
+            assert [
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ] == ["Disable"]
+
+        publish_firmware_status(_env.probe_module, "InvalidSignature", request_id=61)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Enable")
+            assert [
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ] == ["Disable", "Enable"]
+
+    async def test_rejected_firmware_request_does_not_disturb_active_cycle(self, _env):
+        availability_mocks = [
+            _env.probe_module_command_mocks[implementation]["enable_disable"]
+            for implementation in ("evse_manager", "evse_manager_b")
+        ]
+        update_mock = _env.probe_module_command_mocks["system"]["update_firmware"]
+        for mock in availability_mocks:
+            mock.reset_mock()
+        update_mock.reset_mock()
+
+        firmware = {
+            "location": "https://example.invalid/firmware.pnx",
+            "retrieveDateTime": "2030-01-01T00:00:00Z",
+            "signingCertificate": "certificate",
+            "signature": "signature",
+        }
+        update_mock.return_value = "Accepted"
+        await _env.charge_point.signed_update_firmware_req(
+            request_id=71, firmware=firmware
+        )
+        await wait_for_mock_called(update_mock)
+
+        publish_firmware_status(
+            _env.probe_module,
+            "InstallScheduled",
+            request_id=71,
+            disable_connectors=True,
+        )
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Disable")
+
+        update_mock.reset_mock()
+        update_mock.return_value = "Rejected"
+        await _env.charge_point.signed_update_firmware_req(
+            request_id=72, firmware=firmware
+        )
+        assert update_mock.call_count == 1
+
+        publish_firmware_status(_env.probe_module, "Installed", request_id=71)
+        for mock in availability_mocks:
+            await wait_for_firmware_availability_state(mock, "Enable")
+            states = [
+                call["cmd_source"]["enable_state"]
+                for call in availability_calls(mock)
+            ]
+            assert states[-1] == "Enable"
+            assert set(states[:-1]) == {"Disable"}
 
     async def test_command_stop(self, _env):
         csms_connection = CSMSConnectionUtils(_env.central_system)
@@ -196,82 +443,12 @@ class TestOCPP16GenericInterfaceIntegration:
             len(_env.csms_mock.on_security_event_notification.mock_calls) == 3
         )  # we expect 3 because of the StartupOfTheDevice, SecurityLogWasCleared, StringTooLong
 
-    @pytest.mark.ocpp_legacy_only
     @pytest.mark.ocpp_config_adaptions(
         GenericOCPP16ConfigAdjustment(
             [("Custom", "ExampleConfigurationKey", "test_value")]
         )
     )
-    async def test_command_get_variables_legacy(self, _env):
-        """The legacy OCPP module ignores the component name and variable
-        instance; variable.name is always treated as a configuration key."""
-        res = await _env.probe_module.call_command(
-            "ocpp",
-            "get_variables",
-            {
-                "requests": [
-                    {
-                        "component_variable": {
-                            "component": {"name": "IGNORED"},
-                            "variable": {"name": "ChargePointId"},
-                        }
-                    },
-                    {
-                        "component_variable": {
-                            "component": {"name": ""},
-                            "variable": {"name": "UNKNOWN"},
-                        },
-                        "attribute_type": "Target",
-                    },
-                    {
-                        "component_variable": {
-                            "component": {"name": ""},
-                            "variable": {
-                                "name": "ExampleConfigurationKey",
-                                "instance": "TO_BE_IGNORED",
-                            },
-                        },
-                        "attribute_type": "Target",  # ignored
-                    },
-                ]
-            },
-        )
-
-        assert res == [
-            {
-                "attribute_type": "Actual",
-                "component_variable": {
-                    "component": {"name": ""},
-                    "variable": {"name": "ChargePointId"},
-                },
-                "status": "Accepted",
-                "value": "cp001",
-            },
-            {
-                "component_variable": {
-                    "component": {"name": ""},
-                    "variable": {"name": "UNKNOWN"},
-                },
-                "status": "UnknownVariable",
-            },
-            {
-                "attribute_type": "Actual",
-                "component_variable": {
-                    "component": {"name": ""},
-                    "variable": {"name": "ExampleConfigurationKey"},
-                },
-                "status": "Accepted",
-                "value": "test_value",
-            },
-        ]
-
-    @pytest.mark.ocpp_multi_only
-    @pytest.mark.ocpp_config_adaptions(
-        GenericOCPP16ConfigAdjustment(
-            [("Custom", "ExampleConfigurationKey", "test_value")]
-        )
-    )
-    async def test_command_get_variables_multi(self, _env):
+    async def test_command_get_variables(self, _env):
         """OCPPmulti never reinterprets a non-empty component name as a
         configuration key (UnknownComponent); the deprecated empty-component
         form still routes to keys, ignoring the variable instance."""
@@ -333,116 +510,12 @@ class TestOCPP16GenericInterfaceIntegration:
             },
         ]
 
-    @pytest.mark.ocpp_legacy_only
     @pytest.mark.ocpp_config_adaptions(
         GenericOCPP16ConfigAdjustment(
             [("Custom", "ExampleConfigurationKey", "test_value")]
         )
     )
-    async def test_command_set_variables_legacy(self, _env):
-        """The legacy OCPP module ignores the component name and variable
-        instance; variable.name is always treated as a configuration key."""
-        res = await _env.probe_module.call_command(
-            "ocpp",
-            "set_variables",
-            {
-                "requests": [
-                    {
-                        "component_variable": {
-                            "component": {"name": "IGNORED"},
-                            "variable": {"name": "RetryBackoffRandomRange"},
-                        },
-                        # standard (non-custom), writable key; will be Accepted.
-                        "value": "99",
-                    },
-                    {
-                        "component_variable": {
-                            "component": {"name": ""},
-                            "variable": {"name": "UNKNOWN"},
-                        },
-                        # does not exist - will be UnknownVariable
-                        "attribute_type": "Target",
-                        "value": "test_value",
-                    },
-                    {
-                        "component_variable": {
-                            "component": {"name": ""},
-                            "variable": {
-                                "name": "ExampleConfigurationKey",
-                                "instance": "TO_BE_IGNORED",
-                            },
-                        },
-                        "attribute_type": "Target",
-                        "value": "unittest changed value",
-                    },
-                ],
-                "source": "testcase",
-            },
-        )
-
-        assert res
-        assert isinstance(res, list) and len(res) == 3
-        assert res == [
-            {
-                "component_variable": {
-                    "component": {"name": "IGNORED"},
-                    "variable": {"name": "RetryBackoffRandomRange"},
-                },
-                "status": "Accepted",
-            },
-            {
-                "component_variable": {
-                    "component": {"name": ""},
-                    "variable": {"name": "UNKNOWN"},
-                },
-                "status": "UnknownVariable",
-            },
-            {
-                "component_variable": {
-                    "component": {"name": ""},
-                    "variable": {
-                        "instance": "TO_BE_IGNORED",
-                        "name": "ExampleConfigurationKey",
-                    },
-                },
-                "status": "Accepted",
-            },
-        ]
-
-        # Verify value changed
-        check = await _env.probe_module.call_command(
-            "ocpp",
-            "get_variables",
-            {
-                "requests": [
-                    {
-                        "component_variable": {
-                            "component": {"name": ""},
-                            "variable": {"name": "ExampleConfigurationKey"},
-                        }
-                    }
-                ]
-            },
-        )
-        assert check == [
-            {
-                "attribute_type": "Actual",
-                "component_variable": {
-                    "component": {"name": ""},
-                    "variable": {"name": "ExampleConfigurationKey"},
-                },
-                "status": "Accepted",
-                "value": "unittest changed value",
-            }
-        ]
-
-    @pytest.mark.ocpp_multi_only
-    @pytest.mark.ocpp_config_adaptions(
-        GenericOCPP16ConfigAdjustment(
-            [("Custom", "ExampleConfigurationKey", "test_value")]
-        )
-    )
-    async def test_command_set_variables_multi(self, _env):
+    async def test_command_set_variables(self, _env):
         """OCPPmulti never reinterprets a non-empty component name as a
         configuration key (UnknownComponent, nothing written); the deprecated
         empty-component form still routes to keys, ignoring the variable
@@ -542,71 +615,7 @@ class TestOCPP16GenericInterfaceIntegration:
             }
         ]
 
-    @pytest.mark.ocpp_legacy_only
-    async def test_command_monitor_variables_legacy(self, _env):
-        """Test monitoring a configuration variable as well as an event_data
-        subscription. The legacy OCPP module ignores the component name and
-        registers the variable name as a configuration key."""
-
-        async def change_var(key: str, value: str):
-            res = await _env.charge_point.change_configuration_req(key=key, value=value)
-            assert res.status == "Accepted"
-
-        event_data_subscription_mock = Mock()
-        _env.probe_module.subscribe_variable(
-            "ocpp", "event_data", event_data_subscription_mock
-        )
-
-        await change_var("HeartbeatInterval", "1")
-
-        # assert no event before monitoring is enabled
-        await asyncio.sleep(0.1)
-        event_data_subscription_mock.assert_not_called()
-
-        # enable monitoring
-        res = await _env.probe_module.call_command(
-            "ocpp",
-            "monitor_variables",
-            {
-                "component_variables": [
-                    {
-                        "component": {"name": "IGNORED"},
-                        "variable": {"name": "HeartbeatInterval"},
-                    },
-                    {
-                        "component": {"name": ""},
-                        "variable": {"name": "MeterValuesAlignedData"},
-                    },
-                    {
-                        "component": {"name": ""},
-                        "variable": {"name": "UNKNOWN"},
-                    },
-                ]
-            },
-        )
-        assert res is None
-
-        # verify event is triggered
-        await change_var("HeartbeatInterval", "42")
-        await wait_for_mock_called(
-            event_data_subscription_mock,
-            mock_call(
-                {
-                    "actual_value": "42",
-                    "component_variable": {
-                        "component": {"name": "IGNORED"},
-                        "variable": {"name": "HeartbeatInterval"},
-                    },
-                    "event_id": ANY,
-                    "event_notification_type": "CustomMonitor",
-                    "timestamp": ANY,
-                    "trigger": "Alerting",
-                }
-            ),
-        )
-
-    @pytest.mark.ocpp_multi_only
-    async def test_command_monitor_variables_multi(self, _env):
+    async def test_command_monitor_variables(self, _env):
         """Test monitoring a configuration variable as well as an event_data
         subscription. OCPPmulti resolves the component, so the canonical
         address must be used; events echo the registered form."""
@@ -669,83 +678,7 @@ class TestOCPP16GenericInterfaceIntegration:
             ),
         )
 
-    @pytest.mark.ocpp_legacy_only
-    async def test_command_monitor_and_get_variables_legacy(self, _env):
-        """Test the combined monitor + get command: monitors are registered
-        like monitor_variables and the current values are returned in the
-        reply with get_variables semantics (key-form echo in the legacy
-        module, request order preserved)."""
-
-        async def change_var(key: str, value: str):
-            res = await _env.charge_point.change_configuration_req(key=key, value=value)
-            assert res.status == "Accepted"
-
-        event_data_subscription_mock = Mock()
-        _env.probe_module.subscribe_variable(
-            "ocpp", "event_data", event_data_subscription_mock
-        )
-
-        await change_var("HeartbeatInterval", "1")
-
-        # assert no event before monitoring is enabled
-        await asyncio.sleep(0.1)
-        event_data_subscription_mock.assert_not_called()
-
-        # enable monitoring and read the current values in one call
-        res = await _env.probe_module.call_command(
-            "ocpp",
-            "monitor_and_get_variables",
-            {
-                "component_variables": [
-                    {
-                        "component": {"name": "IGNORED"},
-                        "variable": {"name": "HeartbeatInterval"},
-                    },
-                    {
-                        "component": {"name": ""},
-                        "variable": {"name": "MeterValuesAlignedData"},
-                    },
-                    {
-                        "component": {"name": ""},
-                        "variable": {"name": "UNKNOWN"},
-                    },
-                ]
-            },
-        )
-        assert isinstance(res, list) and len(res) == 3
-        # results follow this module's get_variables semantics: key-form echo
-        assert res[0]["component_variable"] == {
-            "component": {"name": ""},
-            "variable": {"name": "HeartbeatInterval"},
-        }
-        assert res[0]["status"] == "Accepted"
-        assert res[0]["value"] == "1"
-        assert res[1]["component_variable"]["variable"]["name"] == "MeterValuesAlignedData"
-        assert res[1]["status"] == "Accepted"
-        assert res[2]["component_variable"]["variable"]["name"] == "UNKNOWN"
-        assert res[2]["status"] == "UnknownVariable"
-
-        # verify the monitors were registered: events echo the requested form
-        await change_var("HeartbeatInterval", "42")
-        await wait_for_mock_called(
-            event_data_subscription_mock,
-            mock_call(
-                {
-                    "actual_value": "42",
-                    "component_variable": {
-                        "component": {"name": "IGNORED"},
-                        "variable": {"name": "HeartbeatInterval"},
-                    },
-                    "event_id": ANY,
-                    "event_notification_type": "CustomMonitor",
-                    "timestamp": ANY,
-                    "trigger": "Alerting",
-                }
-            ),
-        )
-
-    @pytest.mark.ocpp_multi_only
-    async def test_command_monitor_and_get_variables_multi(self, _env):
+    async def test_command_monitor_and_get_variables(self, _env):
         """Test the combined monitor + get command with OCPPmulti: canonical
         addressing, results and events echo the requested form, request
         order preserved."""

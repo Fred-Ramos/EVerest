@@ -847,15 +847,18 @@ void Charger::run_state_machine() {
                 }
 
                 // Power is available or we are in HLC, PWM is already enabled. Check if we can go to charging
-                if ((shared_context.iec_allow_close_contactor and not hlc_use_5percent_current_session) or
+                if ((shared_context.iec_allow_close_contactor and not hlc_use_5percent_current_session and
+                     not state_c_may_be_validation_toggle()) or
                     (shared_context.iec_allow_close_contactor and shared_context.hlc_allow_close_contactor and
                      hlc_use_5percent_current_session)) {
                     set_state(EvseState::Charging);
                 } else {
                     // We have power and PWM is on, but EV did not proceed to state C yet (and/or HLC is not
                     // ready)
+                    // An EV with an established data link is no legacy EV. State E/F would make SLAC leave the
+                    // logical network under its running V2G session, whose own timeouts end it in order.
                     if (not shared_context.hlc_charging_active and not shared_context.legacy_wakeup_done and
-                        time_in_current_state > LEGACY_WAKEUP_TIMEOUT) {
+                        not shared_context.dlink_established and time_in_current_state > LEGACY_WAKEUP_TIMEOUT) {
                         session_log.evse(false, "EV did not transition to state C, trying one legacy wakeup "
                                                 "according to IEC61851-1 A.5.3");
                         shared_context.legacy_wakeup_done = true;
@@ -1380,6 +1383,10 @@ void Charger::process_event(CPEvent cp_event) {
 }
 
 void Charger::process_cp_events_state(CPEvent cp_event) {
+    if (cp_event == CPEvent::CarRequestedPower) {
+        internal_context.car_requested_power_at = std::chrono::steady_clock::now();
+    }
+
     switch (shared_context.current_state) {
 
     case EvseState::Idle:
@@ -1408,7 +1415,7 @@ void Charger::process_cp_events_state(CPEvent cp_event) {
             signal_dc_supply_off();
             // CC.3.6 t806: the EV signals its open disconnection device with C->B and continues with
             // ChargeParameterDiscovery, so the session stays in PrepareCharging.
-            if (not shared_context.hlc_dc_renegotiation) {
+            if (not shared_context.hlc_dc_renegotiation and not slac_matching_in_progress()) {
                 shared_context.current_state = EvseState::ChargingPausedEVSE;
             }
         }
@@ -1688,7 +1695,6 @@ bool Charger::resume_charging() {
         return true;
     }
     return false;
-    return true;
 }
 
 // The HLC session was ended by the EV because the EVSE paused it, and the user pause has been lifted.
@@ -2523,6 +2529,17 @@ void Charger::request_error_sequence_internal() {
             shared_context.current_state = EvseState::T_step_EF;
             signal_slac_reset();
         }
+    } else if (shared_context.dlink_established and config_context.charge_mode == ChargeMode::AC and
+               not shared_context.hlc_charging_active and not hlc_use_5percent_current_session and
+               (shared_context.current_state == EvseState::ChargingPausedEV or
+                shared_context.current_state == EvseState::ChargingPausedEVSE)) {
+        // A data link lost while basic charging at nominal PWM is paused: the same X1 -> E/F sequence
+        // ([V2G3-M07-05]), then the pause goes on. With 5 percent the wake-up link watchdog covers the pause.
+        internal_context.t_step_EF_return_state = shared_context.current_state;
+        internal_context.t_step_EF_return_pwm = 0.;
+        internal_context.t_step_EF_return_ampere = 0.;
+        internal_context.t_step_X1_until_unmatched = true;
+        shared_context.current_state = EvseState::T_step_X1;
     }
     // SLAC has given the link up whichever state the error routine met; the next one is a new matching failure.
     shared_context.dlink_established = false;
@@ -2539,6 +2556,15 @@ void Charger::set_dlink_ready(bool ready) {
 void Charger::set_matching_started(bool m) {
     Everest::scoped_lock_timeout lock(state_machine_mutex, Everest::MutexDescription::Charger_set_matching_started);
     shared_context.matching_started = m;
+}
+
+bool Charger::slac_matching_in_progress() const {
+    return shared_context.matching_started and not shared_context.slac_matched;
+}
+
+bool Charger::state_c_may_be_validation_toggle() const {
+    return slac_matching_in_progress() and
+           std::chrono::steady_clock::now() - internal_context.car_requested_power_at < VALIDATION_TOGGLE_HOLD;
 }
 
 void Charger::set_slac_matched(bool matched) {
@@ -2673,6 +2699,14 @@ void Charger::notify_session_stop_res_sent(types::iso15118::SessionStopAction ac
         return;
     }
     if (not shared_context.hlc_charging_active) {
+        const bool session_setup = shared_context.current_state == EvseState::WaitingForAuthentication or
+                                   shared_context.current_state == EvseState::PrepareCharging;
+        if (action == types::iso15118::SessionStopAction::FailedTermination and hlc_use_5percent_current_session and
+            session_setup) {
+            // The communication setup failed before a V2G session was established. The D-LINK_ERROR that runs
+            // the [V2G3-M07-05] sequence follows once the TCP close crossed the data link; its X1 starts here.
+            cp_state_X1();
+        }
         return;
     }
     shared_context.hlc_allow_close_contactor = false;

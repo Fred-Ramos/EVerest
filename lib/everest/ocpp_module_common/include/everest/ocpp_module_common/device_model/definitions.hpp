@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ocpp/v2/ctrlr_component_variables.hpp>
+#include <ocpp/v2/device_model_interface.hpp>
 
 #include <string>
 #include <vector>
@@ -11,13 +12,18 @@
 using ocpp::v2::EVSE;
 using ocpp::v2::VariableCharacteristics;
 
+namespace ocpp_module_common::device_model {
+using ocpp::v2::VARIABLE_OWNER_COMPONENT_CONFIG;
+/// \brief Owner of the components that EverestDeviceModel registers
+inline constexpr auto VARIABLE_OWNER_EVEREST = "EVEREST";
+} // namespace ocpp_module_common::device_model
+
 namespace EvseDefinitions {
 
 EVSE get_evse(const int32_t evse_id, const std::optional<int32_t>& connector_id = std::nullopt);
 
 namespace Characteristics {
 extern const VariableCharacteristics AllowReset;
-extern const VariableCharacteristics AvailabilityState;
 extern const VariableCharacteristics Available;
 extern const VariableCharacteristics EvseId;
 extern VariableCharacteristics EVSEPower;
@@ -28,7 +34,6 @@ extern const VariableCharacteristics ISO15118EvseId;
 
 namespace ConnectorDefinitions {
 namespace Characteristics {
-extern const VariableCharacteristics AvailabilityState;
 extern const VariableCharacteristics Available;
 extern const VariableCharacteristics ConnectorType;
 extern const VariableCharacteristics SupplyPhases;
