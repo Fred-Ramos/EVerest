@@ -21,6 +21,7 @@ target_link_libraries(${MODULE_NAME}
 
 target_sources(${MODULE_NAME}
     PRIVATE
+        "main/log_files.cpp"
         "main/systemImpl.cpp"
 )
 
@@ -38,4 +39,8 @@ install(
         signed_firmware_metadata_parser.sh
     DESTINATION "${EVEREST_MODULE_INSTALL_PREFIX}/${MODULE_NAME}"
 )
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
 # ev@c55432ab-152c-45a9-9d2e-7281d50c69c3:v1

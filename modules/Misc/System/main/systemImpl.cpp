@@ -5,20 +5,25 @@
 #include "everest/logging.hpp"
 #include "generated/types/system.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #include <unistd.h>
 
+#include <date/tz.h>
 #include <utils/date.hpp>
 
 #include <everest/run_application/run_application.hpp>
+
+#include "log_files.hpp"
 
 using namespace everest::run_application;
 
@@ -80,6 +85,35 @@ bool split_key_value(const std::string& key_value, std::string& key, std::string
 namespace {
 bool is_option_like(const std::string& location) {
     return !location.empty() && location.front() == '-';
+}
+
+const std::string SECURITY_LOG_TYPE = "SecurityLog";
+
+/// The time bound \p timestamp of a log upload request, unset when the request has none or it is not RFC 3339.
+std::optional<std::chrono::system_clock::time_point> parse_log_bound(const std::optional<std::string>& timestamp,
+                                                                     const std::string& name) {
+    if (!timestamp.has_value() || timestamp.value().empty()) {
+        return std::nullopt;
+    }
+    const auto parsed = Everest::Date::try_from_rfc3339(timestamp.value());
+    if (!parsed.has_value()) {
+        EVLOG_warning << "Ignoring the " << name
+                      << " of the log upload request, not an RFC 3339 date-time: " << timestamp.value();
+        return std::nullopt;
+    }
+    return std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        date::clock_cast<std::chrono::system_clock>(parsed.value()));
+}
+
+fs::path create_temp_dir(const fs::path& dir, const std::string& prefix) {
+    const std::string dir_template = (dir / prefix).string() + "XXXXXX";
+    std::vector<char> dir_template_buffer{dir_template.begin(), dir_template.end()};
+    dir_template_buffer.push_back('\0');
+    if (mkdtemp(dir_template_buffer.data()) == nullptr) {
+        EVLOG_error << "Failed to create temporary directory at: " << dir_template;
+        return {};
+    }
+    return dir_template_buffer.data();
 }
 } // namespace
 
@@ -530,6 +564,41 @@ systemImpl::handle_upload_logs(types::system::UploadLogsRequest& upload_logs_req
         return response;
     }
 
+    // OCPP 1.6 GetDiagnostics carries no type: it asks for diagnostics
+    const bool security_log = upload_logs_request.type.value_or("") == SECURITY_LOG_TYPE;
+    const auto& log_directory =
+        security_log ? this->mod->config.SecurityLogDirectory : this->mod->config.DiagnosticsLogDirectory;
+    const auto& log_file_filter =
+        security_log ? this->mod->config.SecurityLogFileFilter : this->mod->config.DiagnosticsLogFileFilter;
+
+    // With a log directory configured, the names of the files in it to pack, and the directory the archive is made
+    // in. Without one, a placeholder file is uploaded as before.
+    std::vector<std::string> log_file_names;
+    fs::path archive_dir;
+    if (!log_directory.empty()) {
+        const auto max_total_size =
+            static_cast<std::uintmax_t>(std::max(0, this->mod->config.LogUploadMaxSizeMB)) * 1024 * 1024;
+        const auto log_files =
+            select_log_files(list_log_files(log_directory, log_file_filter),
+                             parse_log_bound(upload_logs_request.oldest_timestamp, "oldest timestamp"),
+                             parse_log_bound(upload_logs_request.latest_timestamp, "latest timestamp"), max_total_size);
+        if (log_files.empty()) {
+            // N01.FR.05: the requested log information is not available
+            EVLOG_info << "Rejecting log upload, no " << (security_log ? "security" : "diagnostics") << " log file in "
+                       << log_directory << " for the requested time range";
+            response.upload_logs_status = types::system::UploadLogsStatus::Rejected;
+            return response;
+        }
+        archive_dir = create_temp_dir(fs::temp_directory_path(), "log-upload-");
+        if (archive_dir.empty()) {
+            response.upload_logs_status = types::system::UploadLogsStatus::Rejected;
+            return response;
+        }
+        for (const auto& log_file : log_files) {
+            log_file_names.push_back(log_file.path.filename().string());
+        }
+    }
+
     {
         auto state = this->log_upload_state.handle();
         if (*state == LogUploadState::Uploading) {
@@ -541,18 +610,23 @@ systemImpl::handle_upload_logs(types::system::UploadLogsRequest& upload_logs_req
         }
     }
 
-    // TODO(piet): consider start time and end time
-    const auto diagnostics_file_path =
-        create_temp_file(fs::temp_directory_path(), this->create_logs_filename("diagnostics"));
+    fs::path diagnostics_file_path;
+    if (log_file_names.empty()) {
+        diagnostics_file_path = create_temp_file(fs::temp_directory_path(), this->create_logs_filename("diagnostics"));
+        const auto fake_diagnostics_file = json({{"diagnostics", {{"key", "value"}}}});
+        std::ofstream diagnostics_file(diagnostics_file_path.c_str());
+        diagnostics_file << fake_diagnostics_file.dump();
+    } else {
+        // Packed in the upload thread, so that a new request can cancel it like an upload (N01.FR.12)
+        diagnostics_file_path =
+            archive_dir / (this->create_logs_filename(security_log ? "security" : "diagnostics") + ".tar.gz");
+    }
     const auto diagnostics_file_name = diagnostics_file_path.filename().string();
 
     response.file_name = diagnostics_file_name;
 
-    const auto fake_diagnostics_file = json({{"diagnostics", {{"key", "value"}}}});
-    std::ofstream diagnostics_file(diagnostics_file_path.c_str());
-    diagnostics_file << fake_diagnostics_file.dump();
-
-    this->upload_logs_thread = std::thread([this, upload_logs_request, diagnostics_file_name, diagnostics_file_path]() {
+    this->upload_logs_thread = std::thread([this, upload_logs_request, diagnostics_file_name, diagnostics_file_path,
+                                            log_directory, log_file_names, archive_dir]() {
         {
             auto state = this->log_upload_state.handle();
             if (*state != LogUploadState::Idle) {
@@ -583,7 +657,10 @@ systemImpl::handle_upload_logs(types::system::UploadLogsRequest& upload_logs_req
                 return CmdControl::Terminate;
             }
             if (output_line == "Uploaded") {
+                // Published once the upload is marked idle, so that a request sent on it is not taken for one
+                // that cancels a running upload
                 log_status.log_status = types::system::string_to_log_status_enum(output_line);
+                return CmdControl::Continue;
             } else if (output_line == "UploadFailure" || output_line == "PermissionDenied" ||
                        output_line == "BadMessage" || output_line == "NotSupportedOperation") {
                 log_status.log_status = types::system::LogStatusEnum::UploadFailure;
@@ -593,7 +670,19 @@ systemImpl::handle_upload_logs(types::system::UploadLogsRequest& upload_logs_req
             this->publish_log_status(log_status);
             return CmdControl::Continue;
         };
-        while (retries < total_retries) {
+
+        bool packed = true;
+        if (!log_file_names.empty()) {
+            packed = pack_log_files(log_directory, log_file_names, diagnostics_file_path, this->interrupt_log_upload);
+            if (!packed && !this->interrupt_log_upload->load()) {
+                EVLOG_error << "Failed to pack the log files into " << diagnostics_file_path;
+                // N01.FR.10
+                log_status.log_status = types::system::LogStatusEnum::UploadFailure;
+                this->publish_log_status(log_status);
+            }
+        }
+
+        while (packed && retries < total_retries) {
             retries += 1;
             run_application(diagnostics_uploader.string(), args, options);
             if (log_status.log_status == types::system::LogStatusEnum::Uploaded) {
@@ -620,12 +709,20 @@ systemImpl::handle_upload_logs(types::system::UploadLogsRequest& upload_logs_req
             *state = LogUploadState::Idle;
         }
         this->log_upload_state.notify_all();
-        if (cancelled) {
+        if (log_status.log_status == types::system::LogStatusEnum::Uploaded) {
+            this->publish_log_status(log_status);
+        } else if (cancelled) {
             EVLOG_info << "Uploading Logs was interrupted, terminating upload script, requestId: "
                        << log_status.request_id;
             // N01.FR.20
             log_status.log_status = types::system::LogStatusEnum::AcceptedCanceled;
             this->publish_log_status(log_status);
+        }
+        std::error_code ec;
+        if (archive_dir.empty()) {
+            fs::remove(diagnostics_file_path, ec);
+        } else {
+            fs::remove_all(archive_dir, ec);
         }
         EVLOG_info << "Log upload thread finished";
     });
