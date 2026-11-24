@@ -53,13 +53,13 @@ One model for OCPP 1.6 and OCPP 2.x
 
 The device model backs configuration and telemetry of both protocol versions. OCPP 2.x addresses it directly with
 ``GetVariables``, ``SetVariables`` and ``GetBaseReport``. OCPP 1.6 knows only configuration keys, so OCPPmulti maps
-each key onto a component and variable: a built-in mapping for the standard keys, custom mappings from
-``Ocpp16KeyMappingsPath``, and the ``OCPP16LegacyCtrlr`` component for keys without a standardized counterpart.
-``GetConfiguration`` and ``ChangeConfiguration`` read and write the mapped variables. A custom mapping names a
-variable of the component configuration: a variable that is registered at runtime, such as a module configuration
-view, cannot be mapped. A variable without a mapping is invisible to an OCPP 1.6 CSMS. OCPP 1.6 has no variable monitoring, so
-telemetry such as ``EVSE`` / ``Power`` reaches a 1.6 CSMS only through ``MeterValues``. The ``ocpp`` interface
-sees every variable in both modes.
+each key onto a component and variable: a built-in mapping for the standard keys, custom mappings from the
+experimental ``Ocpp16KeyMappingsPath``, and the ``OCPP16LegacyCtrlr`` component for keys without a standardized
+counterpart. ``GetConfiguration`` and ``ChangeConfiguration`` read and write the mapped variables. A custom mapping
+names a variable of the component configuration: a variable that is registered at runtime, such as a module
+configuration view, cannot be mapped. A variable without a mapping is invisible to an OCPP 1.6 CSMS. OCPP 1.6 has no
+variable monitoring, so telemetry such as ``EVSE`` / ``Power`` reaches a 1.6 CSMS only through ``MeterValues``. The
+``ocpp`` interface sees every variable in both modes.
 
 Who contributes
 ---------------
@@ -682,9 +682,6 @@ libocpp deviates from OCPP in these points:
 * A preconfigured monitor the CSMS changed does not come back when SetMonitoringBase deletes the custom monitors,
   only at the next start or, for a registered variable, at the next registration (N03.FR.03, N03.FR.04;
   `#1994 <https://github.com/EVerest/EVerest/issues/1994>`_).
-* SetVariableMonitoring with the id of a hardwired monitor is accepted and stores the changed monitor as custom
-  (N04.FR.18; `#3399 <https://github.com/EVerest/EVerest/issues/3399>`_). A registration that
-  declares the hardwired monitor replaces it again.
 * A variable can have two monitors of the same type and severity (N04.FR.10;
   `#3400 <https://github.com/EVerest/EVerest/issues/3400>`_): the component configuration adds a
   declared monitor again at the next start next to the custom monitor the CSMS changed it into, and a
